@@ -1,0 +1,194 @@
+{
+  "url": "http://64.227.158.224/",
+  "ts": "2026-10-25T17:32:52",
+  "steps": {
+    "fingerprint": {
+      "url": "http://64.227.158.224/",
+      "status": 200,
+      "error": null,
+      "server": "Apache/2.4.58 (Ubuntu)",
+      "x_powered_by": "PHP/8.4.26",
+      "set_cookie": "PHPSESSID=08c6f24fecd38276f40ebcf5dee7f82d; path=/",
+      "php_version": "8.4.26",
+      "sink_candidate": true
+    },
+    "sinks": [
+      {
+        "path": "/",
+        "status": 200,
+        "set_cookie": "PHPSESSID=3be60904389a62163d3e9d67fdb9ff0e; path=/"
+      },
+      {
+        "path": "/workshop",
+        "status": 200,
+        "set_cookie": "PHPSESSID=0d0819b480caa7a4c385f44d8639cbdf; path=/"
+      },
+      {
+        "path": "/estimates",
+        "status": 200,
+        "set_cookie": "PHPSESSID=359aa315b162baf28402ab9a2c20876b; path=/"
+      },
+      {
+        "path": "/upload.php",
+        "status": 200,
+        "set_cookie": "PHPSESSID=f1d86b0df7917cc379688bacc4268489; path=/"
+      },
+      {
+        "path": "/visit",
+        "status": 200,
+        "set_cookie": "PHPSESSID=ca7ea581bcd41bb8f6c8f3d7cc5c47cb; path=/"
+      },
+      {
+        "path": "/index.php",
+        "status": 200,
+        "set_cookie": "PHPSESSID=0c9f62496c9cd82fc02f65d390ea54ae; path=/"
+      },
+      {
+        "path": "/index.html",
+        "status": 404,
+        "set_cookie": "PHPSESSID=4b302fc28f4ec38e83382f25e2b23482; path=/"
+      },
+      {
+        "path": "/login.php",
+        "status": 404,
+        "set_cookie": "PHPSESSID=bfa1d59d15261abf60e70cf63f6aec3b; path=/"
+      },
+      {
+        "path": "/admin.php",
+        "status": 404,
+        "set_cookie": "PHPSESSID=42a84c31feb918d76f485a50fff3f07b; path=/"
+      },
+      {
+        "path": "/home.php",
+        "status": 404,
+        "set_cookie": "PHPSESSID=207fff6f7f997d5523facbd642af7447; path=/"
+      },
+      {
+        "path": "/app.php",
+        "status": 404,
+        "set_cookie": "PHPSESSID=48c2ff940a2615afdf0bba3ef6d94cc7; path=/"
+      },
+      {
+        "path": "/test.php",
+        "status": 404,
+        "set_cookie": "PHPSESSID=bb056fea1f3a9ab1161692d535115c4e; path=/"
+      },
+      {
+        "path": "/info.php",
+        "status": 404,
+        "set_cookie": "PHPSESSID=61999002bea93ab4e8feb1170dd8a9d6; path=/"
+      }
+    ],
+    "cl_probe": {
+      "attempts": [
+        {
+          "mb": 2,
+          "status": 0,
+          "error": "timeout",
+          "len": 2097353,
+          "oom": null,
+          "elapsed": 21.83
+        },
+        {
+          "mb": 4,
+          "status": 0,
+          "error": "timeout",
+          "len": 4194505,
+          "oom": null,
+          "elapsed": 21.93
+        },
+        {
+          "mb": 8,
+          "status": 0,
+          "error": "timeout",
+          "len": 8388809,
+          "oom": null,
+          "elapsed": 22.1
+        },
+        {
+          "mb": 16,
+          "status": 0,
+          "error": "timeout",
+          "len": 16777418,
+          "oom": null,
+          "elapsed": 21.35
+        }
+      ],
+      "oom": null,
+      "post_max_blocked": false
+    },
+    "header_bomb": {
+      "attempts": [
+        {
+          "lines": 100000,
+          "mb": 0.57,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 34.01
+        },
+        {
+          "lines": 200000,
+          "mb": 1.14,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 80.4
+        },
+        {
+          "lines": 400000,
+          "mb": 2.29,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 52.56
+        },
+        {
+          "lines": 800000,
+          "mb": 4.58,
+          "status": 500,
+          "error": null,
+          "oom": null,
+          "elapsed": 158.14
+        }
+      ],
+      "oom": null,
+      "oom_suspected": {
+        "status": 500,
+        "lines": 800000,
+        "mb": 4.58
+      },
+      "threshold_lines": 800000
+    },
+    "dirty": {
+      "oom_triggers": 8,
+      "fatal_hits": 8,
+      "checks": [
+        {
+          "status": 200,
+          "error": null,
+          "elapsed": 4.03
+        },
+        {
+          "status": 200,
+          "error": null,
+          "elapsed": 4.0
+        },
+        {
+          "status": 200,
+          "error": null,
+          "elapsed": 3.14
+        },
+        {
+          "status": 200,
+          "error": null,
+          "elapsed": 3.32
+        }
+      ],
+      "corrupted": false
+    }
+  },
+  "oom_landing": null,
+  "verdict": "AFFECTED_DOS_ONLY",
+  "landing_stage": "unknown (no error echo)"
+}

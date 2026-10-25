@@ -130,6 +130,7 @@ pre.log{background:#0a1219;border:1px solid var(--line);border-radius:9px;paddin
 .badge.b-likely { background: #7c2d12; color: #ffedd5; border-color: #c2410c; }
 .badge.b-dos { background: #78350f; color: #fef3c7; border-color: #b45309; }
 .badge.b-unknown { background: #1e3a5f; color: #dbeafe; border-color: #2563eb; }
+.badge.b-nosink { background: #1f2937; color: #e5e7eb; border-color: #6b7280; }
 .badge.b-clean { background: #14532d; color: #dcfce7; border-color: #16a34a; }
 .badge.b-error { background: #3f1d38; color: #fce7f3; border-color: #be185d; }
 .badge.b-running { background: #0c4a6e; color: #e0f2fe; border-color: #0284c7; }

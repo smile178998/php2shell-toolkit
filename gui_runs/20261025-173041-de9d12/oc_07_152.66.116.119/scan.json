@@ -1,0 +1,17 @@
+{
+  "url": "http://152.66.116.119/",
+  "ts": "2026-10-25T17:30:47",
+  "steps": {
+    "fingerprint": {
+      "url": "http://152.66.116.119/",
+      "status": 0,
+      "error": "reset",
+      "server": null,
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    }
+  },
+  "verdict": "UNREACHABLE"
+}

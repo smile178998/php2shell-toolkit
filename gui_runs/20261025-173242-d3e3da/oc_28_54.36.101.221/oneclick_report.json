@@ -1,0 +1,22 @@
+{
+ "target": "http://54.36.101.221/",
+ "started": "2026-10-25T17:32:48",
+ "steps": [
+  {
+   "step": "scan",
+   "rc": 50,
+   "verdict": "UNREACHABLE",
+   "php_version": null,
+   "server": null
+  }
+ ],
+ "verdict": "UNREACHABLE",
+ "rce": false,
+ "exit": 50,
+ "artifacts": {},
+ "php_version": null,
+ "server": null,
+ "precondition": null,
+ "sink": false,
+ "finished": "2026-10-25T17:32:49"
+}

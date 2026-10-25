@@ -14,7 +14,7 @@
               勾选「深度探测」才发 OOM 落点探测（最大 16MB body，可能 5xx）；
     oneclick  真实 RCE 链（需再勾选「确认执行攻击」）：Stage-1/2 泄漏 + 伪造 HashTable +
               短命令执行 + HTTP 回读 proof，结果取 oneclick_report.json；
-- 公网目标必须勾选「已获授权」且（推荐）填授权范围，否则服务端直接 denied（不发起任何请求）；
+- 不做任何地址范围校验：粘贴的目标直接进入队列，公网 IP 也可直接使用；
 - 所有结果落盘到 gui_runs/<job_id>/，支持 JSON / CSV 导出。
 """
 import argparse
@@ -40,11 +40,11 @@ P2S = os.path.join(ROOT, "attack", "p2s_ext.py")
 PY = sys.executable or "python3"
 
 def _max_workers():
-    """GUI 并发上限：环境变量 P2S_MAX_WORKERS（默认 16，硬上限 64）。"""
+    """GUI 并发上限：环境变量 P2S_MAX_WORKERS（默认 32，硬上限 64）。"""
     try:
-        n = int(os.environ.get("P2S_MAX_WORKERS", "16") or 16)
+        n = int(os.environ.get("P2S_MAX_WORKERS", "32") or 32)
     except ValueError:
-        n = 16
+        n = 32
     return max(1, min(64, n))
 STATIC = os.path.join(HERE, "static")
 WORKROOT = os.environ.get("WS_GUI_WORK") or os.path.join(os.getcwd(), "gui_runs")
@@ -111,80 +111,22 @@ def is_public_host(host):
     return True
 
 
-def all_targets_private(targets):
-    """全部目标都是内网/回环 → 视为本地靶场，无需公网授权声明"""
-    if not targets:
-        return False
-    return all(not is_public_host(t) for t in targets)
-
-
-def scope_match(host, entries):
-    """scope 条目：精确域名 / *.domain（含裸域）/ CIDR / URL 前缀"""
-    if not entries:
-        return False
-    h = (host or "").strip("[]").lower()
-    try:
-        ip = ipaddress.ip_address(h)
-    except ValueError:
-        ip = None
-    for e in entries:
-        e = e.strip()
-        if not e or e.startswith("#"):
-            continue
-        if "://" in e:
-            eh = (urlparse(e).hostname or "").lower()
-            if eh and (h == eh or h.endswith("." + eh)):
-                return True
-            continue
-        if e.startswith("*."):
-            base = e[2:].lower()
-            if h == base or h.endswith("." + base):
-                return True
-            continue
-        if "/" in e:
-            try:
-                net = ipaddress.ip_network(e, strict=False)
-            except ValueError:
-                continue
-            if ip is not None and ip in net:
-                return True
-            if ip is None:
-                try:
-                    if ipaddress.ip_address(socket.gethostbyname(h)) in net:
-                        return True
-                except Exception:
-                    pass
-            continue
-        if h == e.lower() or h.endswith("." + e.lower()):
-            return True
-    return False
-
-
 def normalize_target(raw):
     t = (raw or "").strip()
     if not t or t.startswith("#"):
         return None
     if "://" not in t:
         t = "http://" + t
+    # 裸 IPv6 必须加方括号，否则 urlparse 会把第一段当 host、其余当 port
+    try:
+        rest = t.split("://", 1)[1]
+        authority = re.split(r"[/?#]", rest, 1)[0]
+        if authority.count(":") >= 2 and not authority.startswith("["):
+            ipaddress.ip_address(authority)  # 仅 IPv6 会通过
+            t = t.replace(authority, "[%s]" % authority, 1)
+    except ValueError:
+        pass
     return t
-
-
-def derive_scope(targets):
-    """粘贴即范围：把本次粘贴的目标主机固化为审计用的 scope。
-
-    目标本身就是测试边界，因此无需再手填「授权范围」；仍保留 authorized 声明，
-    用于区分「自有/已授权资产」与「未授权公网」。
-    """
-    out, seen = [], set()
-    for raw in targets:
-        t = normalize_target(raw)
-        if not t:
-            continue
-        h = urlparse(t).hostname
-        if h and h.lower() not in seen:
-            seen.add(h.lower())
-            out.append(h)
-    return out
 
 
 def cve_verdict(rc, mode):
@@ -256,6 +198,10 @@ def synth_cve(log, rc, url, mode, report, err):
     tgt = {"status": cve_status(rc), "rc": rc, "summary": desc,
            "findings": [finding] if rc in (0, 10) else [],
            "evidence": ev, "verdict": verdict, "log": log[-20000:]}
+    if verdict == "NO_SESSION_SINK":
+        tgt["status"] = "no_sink"
+    elif verdict == "UNKNOWN_PRECOND":
+        tgt["status"] = "unknown"
     return tgt
 
 
@@ -268,19 +214,12 @@ def safe_name(url, i):
 
 # ------------------------------------------------------------------ Job
 class Job(object):
-    def __init__(self, targets, opts, authorized, scope):
+    def __init__(self, targets, opts):
         self.id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
         self.dir = os.path.join(WORKROOT, self.id)
         os.makedirs(self.dir, exist_ok=True)
         self.created = time.time()
         self.opts = opts
-        self.authorized = bool(authorized)
-        self.scope = scope
-        self.scope_file = None
-        if scope:
-            self.scope_file = os.path.join(self.dir, "scope.txt")
-            with io.open(self.scope_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(scope) + "\n")
         self.stop_flag = threading.Event()
         self.lock = threading.Lock()
         self.done = 0
@@ -317,23 +256,6 @@ class Job(object):
             tgt["url"], tgt["host"], tgt["public"] = url, host, pub
             tgt["started"] = time.time()
             tgt["status"] = "running"
-        # 授权闸门：公网目标必须已授权，且（若填了 scope）必须命中
-        if pub and not self.authorized:
-            with self.lock:
-                tgt["status"] = "denied"
-                tgt["rc"] = 3
-                tgt["error"] = "公网目标未确认授权，未发起任何请求"
-                tgt["ended"] = time.time()
-                tgt["duration"] = 0.0
-            return
-        if self.scope and not scope_match(host, self.scope):
-            with self.lock:
-                tgt["status"] = "denied"
-                tgt["rc"] = 3
-                tgt["error"] = "不在授权范围（scope）内，未发起任何请求"
-                tgt["ended"] = time.time()
-                tgt["duration"] = 0.0
-            return
 
         o = self.opts
         mode = (o.get("mode") or "recon").lower()
@@ -346,13 +268,14 @@ class Job(object):
             args.append("--insecure")
         if o.get("timeout"):
             args += ["--timeout", str(o["timeout"])]
-        if getattr(self, "authorized", False):
-            args.append("--i-have-authorization")
         py = [PY, str(P2S)]
         if mode == "recon":
             report_path = os.path.join(self.dir, name + ".recon.json")
             cmd = py + ["recon"] + args + ["--json"]
-            if o.get("deep"):
+            if o.get("fast"):
+                # 快速初筛：只查首页版本 + 2 个 sink，约 3 个请求
+                cmd.append("--fast")
+            elif o.get("deep"):
                 cmd += ["--deep", "--budget", str(o.get("budget") or 6),
                         "--delay", str(o.get("delay") if o.get("delay") is not None else 0.3)]
                 if o.get("probe_sizes"):
@@ -370,6 +293,18 @@ class Job(object):
             ]
         _pt = int(o.get("per_target_timeout") or 900)
         rc, log = self._exec(cmd, log_path, _pt)
+        if "[TIMEOUT]" in log:
+            # 子进程被 per-target timeout 杀掉，报告文件通常还没写出来；
+            # 不要再把 FileNotFoundError 当成“报告错误”展示。
+            return {
+                "status": "error", "rc": 2, "verdict": "TIMEOUT",
+                "summary": "[%s] %s → TIMEOUT（超过 %ss，进程已终止，未生成报告）"
+                           % (mode, url, _pt),
+                "findings": [],
+                "evidence": {"mode": mode, "verdict": "TIMEOUT",
+                             "timeout_s": _pt, "report_error": ""},
+                "log": log[-20000:],
+            }
         report, perr = self._load_report(report_path, log)
         return synth_cve(log, rc, url, mode, report, perr)
 
@@ -453,7 +388,6 @@ class Job(object):
         return {
             "job_id": self.id, "status": self.status,
             "created": self.created, "elapsed": round(time.time() - self._t0, 1),
-            "authorized": self.authorized, "scope": self.scope,
             "opts": {k: v for k, v in self.opts.items()},
             "total": self.total,
             "done": sum(1 for t in self.targets
@@ -559,7 +493,7 @@ class Handler(BaseHTTPRequestHandler):
 
         强制要求检索语句带 net:/org:/hostname:/asn: 限定，避免把公开引擎
         变成「全网挑选第三方受害者」的批量攻击入口；导入结果只是候选清单，
-        仍需人工确认授权后才会进入扫描队列。
+        是否扫描仍需你显式操作（不会自动入队）。
         """
         b = self._body()
         key = (b.get("api_key") or os.environ.get("SHODAN_API_KEY") or "").strip()
@@ -642,23 +576,6 @@ class Handler(BaseHTTPRequestHandler):
         if max_targets > 0 and len(targets) > max_targets:
             return self._send(400, {"error": "单次最多 %d 个目标（P2S_MAX_TARGETS 可调），请分批" % max_targets,
                                     "target_count": len(targets)})
-        scope = b.get("scope") or []
-        if isinstance(scope, str):
-            scope = [x.strip() for x in re.split(r"[\r\n,;]+", scope) if x.strip()]
-        if not scope:
-            scope = derive_scope(targets)  # 粘贴即范围，无需手填授权范围
-        authorized = bool(b.get("authorized"))
-        local_only = all_targets_private(targets)
-        if local_only:
-            authorized = True  # 内网/回环目标（本地靶场）自动视为已授权，无需勾选
-        else:
-            publics = [t for t in targets if is_public_host(t)]
-            if publics and not authorized:
-                return self._send(400, {
-                    "error": "存在公网目标，需要勾选授权确认（仅一次，浏览器会记住）："
-                             "我确认对所填公网目标已获得书面授权。内网/回环目标无需勾选。",
-                    "public_targets": publics[:20],
-                    "public_count": len(publics)})
         mode = (b.get("mode") or "recon").lower()
         if mode not in ("recon", "oneclick"):
             mode = "recon"
@@ -668,19 +585,20 @@ class Handler(BaseHTTPRequestHandler):
         opts = {
             "mode": mode,
             "attack_ack": attack_ack,
-            "deep": bool(b.get("deep")),
+            "fast": bool(b.get("fast")),
+            "deep": bool(b.get("deep")) and not bool(b.get("fast")),
             "budget": max(1, min(8, int(b.get("budget") or 6))),
             "probe_sizes": (b.get("probe_sizes") or "0.5,1,2,4,8,16").strip(),
             "rounds": max(1, min(20, int(b.get("rounds") or 6))),
             "tries": max(1, min(5, int(b.get("tries") or 2))),
             "only": (b.get("only") or "id").strip()[:200],
-            "concurrency": max(1, min(_max_workers(), int(b.get("concurrency") or 8))),
+            "concurrency": max(1, min(_max_workers(), int(b.get("concurrency") or 16))),
             "timeout": max(3, min(120, int(b.get("timeout") or 20))),
             "delay": max(0.0, min(10.0, float(b.get("delay") if b.get("delay") is not None else 0.3))),
             "insecure": bool(b.get("insecure")),
             "per_target_timeout": max(60, min(7200, int(b.get("per_target_timeout") or 1800))),
         }
-        job = Job(targets, opts, authorized, scope)
+        job = Job(targets, opts)
         with JOBS_LOCK:
             JOBS[job.id] = job
         threading.Thread(target=job.run, daemon=True).start()

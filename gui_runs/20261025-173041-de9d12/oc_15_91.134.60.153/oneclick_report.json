@@ -1,0 +1,22 @@
+{
+ "target": "http://91.134.60.153/",
+ "started": "2026-10-25T17:30:57",
+ "steps": [
+  {
+   "step": "scan",
+   "rc": 50,
+   "verdict": "UNREACHABLE",
+   "php_version": null,
+   "server": null
+  }
+ ],
+ "verdict": "UNREACHABLE",
+ "rce": false,
+ "exit": 50,
+ "artifacts": {},
+ "php_version": null,
+ "server": null,
+ "precondition": null,
+ "sink": false,
+ "finished": "2026-10-25T17:31:00"
+}

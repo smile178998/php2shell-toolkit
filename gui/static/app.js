@@ -10,11 +10,13 @@
     NEEDS_PRECOND_PROBE: "b-unknown",
     DOS_ONLY: "b-dos", UNKNOWN_VERSION: "b-unknown",
     NOT_AFFECTED: "b-clean", NO_SINK: "b-clean",
-    UNREACHABLE: "b-error", DENIED: "b-error", UNKNOWN: "b-unknown"
+    UNREACHABLE: "b-error", DENIED: "b-error", UNKNOWN: "b-unknown",
+    TIMEOUT: "b-error"
   };
   var STATUS_BADGE = {
     found: "b-found", likely: "b-likely", dos: "b-dos", clean: "b-clean",
     unknown: "b-unknown", denied: "b-error", error: "b-error",
+    no_sink: "b-nosink",
     running: "b-running", queued: "b-queued", stopped: "b-unknown"
   };
 
@@ -55,11 +57,21 @@
     el.className = "badge " + (ok ? "b-clean" : "b-error");
   }
 
+  function refreshFast() {
+    var fast = $("fast").checked;
+    var deep = $("deep").checked && !fast;
+    $("deep").disabled = fast;
+    ["budget", "delay", "probe_sizes"].forEach(function (id) {
+      $(id).disabled = fast || !deep;
+    });
+  }
+
   function refreshMode() {
     var m = mode();
     $("recon-opts").classList.toggle("dim", m !== "recon");
     $("attack-opts").classList.toggle("dim", m !== "oneclick");
     $("attack_ack").disabled = (m !== "oneclick");
+    refreshFast();
   }
 
   function payload() {
@@ -68,16 +80,15 @@
     if (!targets.length) { throw new Error("请先填写目标 URL（每行一个）"); }
     var body = {
       targets: targets,
-      scope: $("scope").value,
-      authorized: $("authorized").checked,
       mode: mode(),
-      concurrency: num("concurrency", 8),
+      concurrency: num("concurrency", 16),
       timeout: num("timeout", 20),
       per_target_timeout: num("per_target_timeout", 900),
       insecure: $("insecure").checked
     };
     if (body.mode === "recon") {
-      body.deep = $("deep").checked;
+      body.fast = $("fast").checked;
+      body.deep = $("fast").checked ? false : $("deep").checked;
       body.budget = num("budget", 6);
       body.delay = num("delay", 0.3);
       body.probe_sizes = $("probe_sizes").value.trim() || "0.5,1,2,4,8,16";
@@ -258,6 +269,8 @@
       r.addEventListener("change", refreshMode);
     });
     $("q").addEventListener("input", function () { if (state.snap) { render(state.snap); } });
+    $("fast").addEventListener("change", refreshFast);
+    $("deep").addEventListener("change", refreshFast);
     $("f-verdict").addEventListener("change", function () { if (state.snap) { render(state.snap); } });
     $("f-status").addEventListener("change", function () { if (state.snap) { render(state.snap); } });
     $("recent").addEventListener("click", function () {

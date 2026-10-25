@@ -1,0 +1,22 @@
+{
+ "target": "http://64.227.158.224/",
+ "started": "2026-10-25T17:32:51",
+ "steps": [
+  {
+   "step": "scan",
+   "rc": 20,
+   "verdict": "AFFECTED_DOS_ONLY",
+   "php_version": "8.4.26",
+   "server": "Apache/2.4.58 (Ubuntu)"
+  }
+ ],
+ "verdict": "AFFECTED_DOS_ONLY",
+ "rce": false,
+ "exit": 20,
+ "artifacts": {},
+ "php_version": "8.4.26",
+ "server": "Apache/2.4.58 (Ubuntu)",
+ "precondition": null,
+ "sink": "/",
+ "finished": "2026-10-25T17:45:34"
+}

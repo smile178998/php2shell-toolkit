@@ -1,0 +1,17 @@
+{
+  "url": "http://104.248.117.15/",
+  "ts": "2026-10-25T17:32:45",
+  "steps": {
+    "fingerprint": {
+      "url": "http://104.248.117.15/",
+      "status": 0,
+      "error": "reset",
+      "server": null,
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    }
+  },
+  "verdict": "UNREACHABLE"
+}

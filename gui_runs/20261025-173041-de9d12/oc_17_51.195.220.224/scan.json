@@ -1,0 +1,17 @@
+{
+  "url": "http://51.195.220.224/",
+  "ts": "2026-10-25T17:31:01",
+  "steps": {
+    "fingerprint": {
+      "url": "http://51.195.220.224/",
+      "status": 0,
+      "error": "reset",
+      "server": null,
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    }
+  },
+  "verdict": "UNREACHABLE"
+}

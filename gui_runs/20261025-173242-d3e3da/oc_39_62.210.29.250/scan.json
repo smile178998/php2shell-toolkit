@@ -1,0 +1,110 @@
+{
+  "url": "http://62.210.29.250/",
+  "ts": "2026-10-25T17:32:56",
+  "steps": {
+    "fingerprint": {
+      "url": "http://62.210.29.250/",
+      "status": 200,
+      "error": null,
+      "server": "nginx",
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    },
+    "sinks": [
+      {
+        "path": "/",
+        "status": 200,
+        "set_cookie": null,
+        "note": "no Set-Cookie; 兜底尝试"
+      }
+    ],
+    "cl_probe": {
+      "attempts": [
+        {
+          "mb": 2,
+          "status": 200,
+          "error": null,
+          "len": 2097353,
+          "oom": null,
+          "elapsed": 22.89
+        },
+        {
+          "mb": 4,
+          "status": 0,
+          "error": "timeout",
+          "len": 4194505,
+          "oom": null,
+          "elapsed": 21.6
+        },
+        {
+          "mb": 8,
+          "status": 0,
+          "error": "timeout",
+          "len": 8388809,
+          "oom": null,
+          "elapsed": 20.32
+        },
+        {
+          "mb": 16,
+          "status": 0,
+          "error": "timeout",
+          "len": 16777418,
+          "oom": null,
+          "elapsed": 21.18
+        }
+      ],
+      "oom": null,
+      "post_max_blocked": false
+    },
+    "header_bomb": {
+      "attempts": [
+        {
+          "lines": 100000,
+          "mb": 0.57,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 20.21
+        },
+        {
+          "lines": 200000,
+          "mb": 1.14,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 41.95
+        },
+        {
+          "lines": 400000,
+          "mb": 2.29,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 59.91
+        },
+        {
+          "lines": 800000,
+          "mb": 4.58,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 144.13
+        },
+        {
+          "lines": 1600000,
+          "mb": 9.16,
+          "status": 200,
+          "error": null,
+          "oom": null,
+          "elapsed": 339.07
+        }
+      ],
+      "oom": null,
+      "oom_suspected": null,
+      "threshold_lines": null
+    }
+  },
+  "verdict": "NOT_AFFECTED_OR_PATCHED"
+}

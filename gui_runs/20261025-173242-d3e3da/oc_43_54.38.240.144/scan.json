@@ -1,0 +1,110 @@
+{
+  "url": "http://54.38.240.144/",
+  "ts": "2026-10-25T17:33:08",
+  "steps": {
+    "fingerprint": {
+      "url": "http://54.38.240.144/",
+      "status": 302,
+      "error": null,
+      "server": "nginx/1.18.0 (Ubuntu)",
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    },
+    "sinks": [
+      {
+        "path": "/",
+        "status": 302,
+        "set_cookie": null,
+        "note": "no Set-Cookie; 兜底尝试"
+      }
+    ],
+    "cl_probe": {
+      "attempts": [
+        {
+          "mb": 2,
+          "status": 413,
+          "error": null,
+          "len": 2097353,
+          "oom": null,
+          "elapsed": 17.09
+        },
+        {
+          "mb": 4,
+          "status": 0,
+          "error": "timeout",
+          "len": 4194505,
+          "oom": null,
+          "elapsed": 21.52
+        },
+        {
+          "mb": 8,
+          "status": 0,
+          "error": "timeout",
+          "len": 8388809,
+          "oom": null,
+          "elapsed": 20.75
+        },
+        {
+          "mb": 16,
+          "status": 0,
+          "error": "timeout",
+          "len": 16777418,
+          "oom": null,
+          "elapsed": 21.09
+        }
+      ],
+      "oom": null,
+      "post_max_blocked": false
+    },
+    "header_bomb": {
+      "attempts": [
+        {
+          "lines": 100000,
+          "mb": 0.57,
+          "status": 302,
+          "error": null,
+          "oom": null,
+          "elapsed": 12.48
+        },
+        {
+          "lines": 200000,
+          "mb": 1.14,
+          "status": 0,
+          "error": "aborted:[Errno 32] Broken pipe",
+          "oom": null,
+          "elapsed": 15.98
+        },
+        {
+          "lines": 400000,
+          "mb": 2.29,
+          "status": 0,
+          "error": "aborted:[Errno 32] Broken pipe",
+          "oom": null,
+          "elapsed": 36.38
+        },
+        {
+          "lines": 800000,
+          "mb": 4.58,
+          "status": 0,
+          "error": "aborted:[Errno 32] Broken pipe",
+          "oom": null,
+          "elapsed": 13.17
+        },
+        {
+          "lines": 1600000,
+          "mb": 9.16,
+          "status": 0,
+          "error": "aborted:[Errno 32] Broken pipe",
+          "oom": null,
+          "elapsed": 34.07
+        }
+      ],
+      "oom": null,
+      "oom_suspected": null,
+      "threshold_lines": null
+    }
+  },
+  "verdict": "NOT_AFFECTED_OR_PATCHED"
+}

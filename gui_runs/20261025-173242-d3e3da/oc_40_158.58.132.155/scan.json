@@ -1,0 +1,111 @@
+{
+  "url": "http://158.58.132.155/",
+  "ts": "2026-10-25T17:33:07",
+  "steps": {
+    "fingerprint": {
+      "url": "http://158.58.132.155/",
+      "status": 502,
+      "error": null,
+      "server": "nginx/1.30.5",
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    },
+    "sinks": [
+      {
+        "path": "/",
+        "status": 502,
+        "set_cookie": null,
+        "note": "no Set-Cookie; 兜底尝试"
+      }
+    ],
+    "cl_probe": {
+      "attempts": [
+        {
+          "mb": 2,
+          "status": 0,
+          "error": "timeout",
+          "len": 2097353,
+          "oom": null,
+          "elapsed": 20.34
+        },
+        {
+          "mb": 4,
+          "status": 0,
+          "error": "timeout",
+          "len": 4194505,
+          "oom": null,
+          "elapsed": 21.51
+        },
+        {
+          "mb": 8,
+          "status": 0,
+          "error": "timeout",
+          "len": 8388809,
+          "oom": null,
+          "elapsed": 20.65
+        },
+        {
+          "mb": 16,
+          "status": 0,
+          "error": "timeout",
+          "len": 16777418,
+          "oom": null,
+          "elapsed": 20.9
+        }
+      ],
+      "oom": null,
+      "post_max_blocked": false
+    },
+    "header_bomb": {
+      "attempts": [
+        {
+          "lines": 100000,
+          "mb": 0.57,
+          "status": 502,
+          "error": null,
+          "oom": null,
+          "elapsed": 13.47
+        }
+      ],
+      "oom": null,
+      "oom_suspected": {
+        "status": 502,
+        "lines": 100000,
+        "mb": 0.57
+      },
+      "threshold_lines": 100000
+    },
+    "dirty": {
+      "oom_triggers": 8,
+      "fatal_hits": 7,
+      "checks": [
+        {
+          "status": 502,
+          "error": null,
+          "elapsed": 9.33
+        },
+        {
+          "status": 502,
+          "error": null,
+          "elapsed": 4.44
+        },
+        {
+          "status": 502,
+          "error": null,
+          "elapsed": 3.51
+        },
+        {
+          "status": 502,
+          "error": null,
+          "elapsed": 2.75
+        }
+      ],
+      "corrupted": true
+    }
+  },
+  "oom_landing": null,
+  "verdict": "RCE_READY",
+  "landing_stage": "unknown (no error echo)"
+}

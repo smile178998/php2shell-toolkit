@@ -1,0 +1,17 @@
+{
+  "url": "http://185.193.115.151/",
+  "ts": "2026-10-25T17:32:47",
+  "steps": {
+    "fingerprint": {
+      "url": "http://185.193.115.151/",
+      "status": 0,
+      "error": "timeout",
+      "server": null,
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    }
+  },
+  "verdict": "UNREACHABLE"
+}

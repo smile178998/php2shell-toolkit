@@ -21,13 +21,8 @@
   <section class="panel">
     <div class="row">
       <div class="col grow">
-        <label>目标 URL（每行一个，仅 http/https 根路径或入口）</label>
+        <label>目标 URL（每行一个，仅 http/https 根路径或入口；支持公网 IP）</label>
         <textarea id="targets" rows="5" spellcheck="false" placeholder="http://127.0.0.1:8090/&#10;https://example.com/index.php"></textarea>
-      </div>
-      <div class="col">
-        <label>授权范围（可选，留空自动从目标派生）</label>
-        <textarea id="scope" rows="5" spellcheck="false" placeholder="127.0.0.1&#10;*.lab.internal"></textarea>
-        <label class="chk"><input type="checkbox" id="authorized"> 我确认对上述目标已获授权（公网必勾）</label>
       </div>
     </div>
 
@@ -42,7 +37,7 @@
       <div class="col">
         <label>通用参数</label>
         <div class="inline">
-          <span>并发 <input type="number" id="concurrency" value="8" min="1" max="32"></span>
+          <span>并发 <input type="number" id="concurrency" value="16" min="1" max="64"></span>
           <span>请求超时 <input type="number" id="timeout" value="20" min="3" max="120"></span>
           <span>单目标超时 <input type="number" id="per_target_timeout" value="900" min="60" max="3600"></span>
           <label class="chk"><input type="checkbox" id="insecure"> 忽略 TLS 证书（--insecure）</label>
@@ -54,7 +49,8 @@
       <div class="col" id="recon-opts">
         <label>recon 选项</label>
         <div class="inline">
-          <label class="chk"><input type="checkbox" id="deep"> 深度探测（发送 OOM 载荷，可能 5xx）</label>
+          <label class="chk"><input type="checkbox" id="fast" checked> 快速模式（只查首页，少发包）</label>
+          <label class="chk"><input type="checkbox" id="deep"> 深度探测（发送 OOM 载荷，慢，可能 5xx）</label>
           <span>budget <input type="number" id="budget" value="6" min="1" max="8"></span>
           <span>delay <input type="number" id="delay" value="0.3" min="0" max="10" step="0.1"></span>
           <span>probe-sizes <input type="text" id="probe_sizes" value="0.5,1,2,4,8,16" size="16"></span>
@@ -99,17 +95,20 @@
       <option>DOS_ONLY</option>
       <option>AFFECTED</option>
       <option>NEEDS_PRECOND_PROBE</option>
+      <option>UNKNOWN_PRECOND</option>
       <option>UNKNOWN_VERSION</option>
       <option>NOT_AFFECTED</option>
+      <option>NO_SESSION_SINK</option>
       <option>NO_SINK</option>
       <option>UNREACHABLE</option>
+      <option>TIMEOUT</option>
       <option>DENIED</option>
     </select>
     <select id="f-status">
       <option value="">全部状态</option>
       <option>queued</option><option>running</option><option>found</option>
       <option>likely</option><option>dos</option><option>clean</option>
-      <option>unknown</option><option>denied</option><option>error</option><option>stopped</option>
+      <option>unknown</option><option>no_sink</option><option>denied</option><option>error</option><option>stopped</option>
     </select>
     <span class="spacer"></span>
     <span class="hint" id="progress-text">-</span>

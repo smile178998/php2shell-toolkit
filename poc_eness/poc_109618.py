@@ -70,6 +70,8 @@ def read_offsets_file(path: str) -> dict[str, int]:
 
 # ---- 全局请求层默认值（由 CLI 注入）----
 DEFAULT_PROXY = None      # 形如 http://127.0.0.1:8080 或 socks5://u:p@127.0.0.1:1080
+# 访问 IP 但目标 vhost 只认域名时，用它覆盖 Host 头（公网靶场常见）
+DEFAULT_HOST_HEADER = None
 # True = 访问 https 目标时跳过证书校验（自签/过期证书靶场）
 # 支持环境变量兜底，便于 p2s_ext 派生子进程时透传 --insecure
 DEFAULT_INSECURE = os.environ.get("PHP2SHELL_INSECURE", "") == "1"
@@ -224,7 +226,7 @@ class Target:
             extra += f"{k}: {v}\r\n"
         hdr = (
             f"POST {self.path} HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
+            f"Host: {DEFAULT_HOST_HEADER or (self.host + ':' + str(self.port))}\r\n"
             f"{extra}"
             f"Content-Type: multipart/form-data; boundary={boundary.decode()}\r\n"
             f"Content-Length: {len(body)}\r\n"
@@ -267,7 +269,7 @@ class Target:
     def get(self, path: str, read_cap: int = 1 << 20) -> tuple[int, bytes]:
         hdr = (
             f"GET {path} HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
+            f"Host: {DEFAULT_HOST_HEADER or (self.host + ':' + str(self.port))}\r\n"
             "Connection: close\r\n"
             "\r\n"
         ).encode()

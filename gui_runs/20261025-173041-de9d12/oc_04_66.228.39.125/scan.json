@@ -1,0 +1,17 @@
+{
+  "url": "http://66.228.39.125/",
+  "ts": "2026-10-25T17:30:46",
+  "steps": {
+    "fingerprint": {
+      "url": "http://66.228.39.125/",
+      "status": 0,
+      "error": "reset",
+      "server": null,
+      "x_powered_by": null,
+      "set_cookie": null,
+      "php_version": null,
+      "sink_candidate": false
+    }
+  },
+  "verdict": "UNREACHABLE"
+}

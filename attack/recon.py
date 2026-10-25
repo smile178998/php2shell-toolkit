@@ -20,7 +20,7 @@
 --------
 - 默认不发送任何超大 body；`--deep` 才会做递增体积的 OOM 落点探测（有节流与预算上限，
   对生产站点仍可能造成 worker 重启/短暂 5xx，属于**需要授权**的主动测试）。
-- 公网目标必须显式 `--i-have-authorization`，否则 exit 3 且零请求。
+- 不再做地址范围校验：公网 IP 可直接作为目标，授权责任由使用者承担。
 - 与 oneclick 的分工：recon 只判定可行性，oneclick 才开火。
 """
 import argparse
@@ -50,6 +50,9 @@ COMMON_ENTRIES = [
     "/api/", "/home.php", "/main.php", "/app/", "/dashboard/", "/user/",
     "/wp-login.php", "/administrator/", "/phpinfo.php", "/info.php",
 ]
+
+# 快速模式：只查首页与 index.php，用于上千目标的批量初筛
+FAST_ENTRIES = ["/", "/index.php"]
 
 PHPINFO_PATHS = ["/phpinfo.php", "/info.php", "/php.php", "/test.php", "/i.php"]
 
@@ -94,7 +97,7 @@ def _hdrs(obj):
 
 
 def is_public_host(host):
-    """域名/不可解析按公网保守处理；只有明确内网/环回才放行。"""
+    """保留供外部脚本引用；recon 自身不再据此拦截目标。"""
     if not host:
         return True
     h = host.strip("[]").split(":")[0]
@@ -204,7 +207,7 @@ def classify_version(v):
     return "unknown", None
 
 
-def probe_version(c, log):
+def probe_version(c, log, fast=False):
     """返回 (candidates:list of (version, channel, evidence), channels:list of dict)"""
     cands = []
     chans = []
@@ -214,8 +217,9 @@ def probe_version(c, log):
         if ver:
             cands.append((ver, channel, ev))
 
-    # 1) 首页 + index.php 的 headers / body
-    for p in ("/", "/index.php"):
+    # 1) 首页 + index.php 的 headers / body（快速模式只打首页，1 个请求）
+    paths = ("/",) if fast else ("/", "/index.php")
+    for p in paths:
         r = c.get(p)
         if r["err"]:
             chans.append({"channel": "http:" + p, "version": None, "evidence": "ERR " + r["err"]})
@@ -233,6 +237,9 @@ def probe_version(c, log):
         if "PHPSESSID" in sc:
             chans.append({"channel": "cookie@" + p, "version": None,
                           "evidence": "Set-Cookie: PHPSESSID（session 消费点存在）"})
+
+    if fast:
+        return cands, chans
 
     # 2) PHP 特殊查询串：logo/credits 能证明「跑 PHP」，且常带版本
     for name, q in MAGIC_QUERIES.items():
@@ -290,7 +297,7 @@ def best_version(cands):
 
 
 # ---------------------------------------------------------------- 消费点
-def probe_sinks(c, entries, log):
+def probe_sinks(c, entries, log, fast=False):
     sinks = []
     for p in entries:
         r = c.get(p)
@@ -299,6 +306,8 @@ def probe_sinks(c, entries, log):
         sc = r["headers"].get("set-cookie", "")
         if "PHPSESSID" in sc:
             sinks.append({"entry": p, "cookie": sc[:160], "code": r["code"]})
+            if fast:
+                break
             continue
         # 非 PHPSESSID 的会话型 cookie（很多框架自定义 session 名）
         for part in sc.split(","):
@@ -313,6 +322,8 @@ def probe_sinks(c, entries, log):
                 sinks.append({"entry": p, "cookie": sc[:160], "code": r["code"],
                               "note": "疑似会话 cookie: " + name})
                 break
+        if fast and sinks:
+            break
         time.sleep(0.05)
     return sinks
 
@@ -446,14 +457,13 @@ def main(argv=None):
         description="CVE-2026-109618 真实站点侦察：多通道版本取证 + 消费点 + 落点 + 偏移匹配")
     ap.add_argument("-u", "--url", required=True, help="目标 URL（http/https）")
     ap.add_argument("--insecure", action="store_true", help="跳过 TLS 证书校验（自签靶场）")
-    ap.add_argument("--i-have-authorization", dest="authorized", action="store_true",
-                    help="公网目标必须显式声明已获授权")
-    ap.add_argument("--allow-public", action="store_true", help="同 --i-have-authorization")
     ap.add_argument("--timeout", type=float, default=12.0)
     ap.add_argument("--ua", default=None)
     ap.add_argument("--entries", default="", help="自定义入口列表（逗号分隔），覆盖默认集")
     ap.add_argument("--deep", action="store_true",
                     help="开启落点探测（发送递增体积 multipart，可能造成 5xx，需授权）")
+    ap.add_argument("--fast", action="store_true",
+                    help="快速模式：只查首页版本 + 最多 2 个 sink 入口（2–3 个请求），跳过 magic/phpinfo/404 与 --deep")
     ap.add_argument("--probe-sizes", default="0.5,1,2,4,8,16")
     ap.add_argument("--budget", type=int, default=6, help="深度探测最多请求数")
     ap.add_argument("--delay", type=float, default=1.0, help="深度探测间隔秒")
@@ -461,24 +471,57 @@ def main(argv=None):
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     a.insecure = a.insecure or _env_insecure()
+    if a.fast and a.deep:
+        sys.stderr.write("[*] --fast 已启用：跳过 --deep 落点探测（快速模式只做只读初筛）\n")
+        a.deep = False
 
     base = a.url.rstrip("/")
-    host = urllib.parse.urlsplit(base).hostname or ""
-    if is_public_host(host) and not (a.authorized or a.allow_public):
-        print("[!] 目标是公网地址（%s）：需显式 --i-have-authorization 才会发请求" % host)
-        return 3
 
     c = Client(base, insecure=a.insecure, timeout=a.timeout, ua=a.ua)
     t0 = time.time()
-    if not a.json:
-        print("[*] recon 目标：%s（insecure=%s deep=%s）" % (base, a.insecure, a.deep))
 
-    cands, chans = probe_version(c, print)
+    # TCP 预检：连不上就立刻判 UNREACHABLE，不再等 3 次 HTTP 超时（批量时差别很大）
+    pu = urllib.parse.urlsplit(base)
+    phost = pu.hostname or ""
+    pport = pu.port or (443 if pu.scheme == "https" else 80)
+    pre_err = None
+    try:
+        sock = socket.create_connection((phost, pport), timeout=min(2.5, a.timeout))
+        sock.close()
+    except Exception as e:
+        pre_err = "%s: %s" % (type(e).__name__, e)
+    if pre_err:
+        report = {
+            "target": base, "insecure": a.insecure, "deep": False, "fast": a.fast,
+            "php_version": None, "version_class": "unknown", "fixed_in": None,
+            "version_channels": [], "session_sinks": [],
+            "deep_probes": [], "precondition": {}, "profile": {},
+            "verdict": "UNREACHABLE",
+            "reason": "TCP 连接失败（%s:%s）: %s" % (phost, pport, pre_err),
+            "next_steps": [], "requests": 0, "bytes": 0, "tcp_ok": False,
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        }
+        if a.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print("[!] TCP 预检失败 %s:%s —— %s" % (phost, pport, pre_err))
+        return 50
+
+    if not a.json:
+        print("[*] recon 目标：%s（fast=%s insecure=%s deep=%s）"
+              % (base, a.fast, a.insecure, a.deep))
+
+    cands, chans = probe_version(c, print, fast=a.fast)
     ver = best_version(cands)
     vclass, fixed = classify_version(ver) if ver else ("unknown", None)
 
-    entries = [x.strip() for x in a.entries.split(",") if x.strip()] or COMMON_ENTRIES
-    sinks = probe_sinks(c, entries, print)
+    entries = ([x.strip() for x in a.entries.split(",") if x.strip()]
+               or (FAST_ENTRIES if a.fast else COMMON_ENTRIES))
+    # 版本已确认修复/过旧时不需要再找 sink，快速模式直接省掉 1–2 个请求
+    if a.fast and vclass in ("patched", "too_old"):
+        sinks = []
+    else:
+        sinks = probe_sinks(c, entries, print, fast=a.fast)
 
     oom_recs, oom = [], {}
     if a.deep:
@@ -495,12 +538,13 @@ def main(argv=None):
     verdict, reason = rce_chain_status(a, ver, vclass, sinks, oom, profile)
     steps = next_steps(base, verdict, profile, a)
     report = {
-        "target": base, "insecure": a.insecure, "deep": a.deep,
+        "target": base, "insecure": a.insecure, "deep": a.deep, "fast": a.fast,
         "php_version": ver, "version_class": vclass, "fixed_in": fixed,
         "version_channels": chans, "session_sinks": sinks,
         "deep_probes": oom_recs, "precondition": oom, "profile": profile,
         "verdict": verdict, "reason": reason, "next_steps": steps,
-        "requests": c.sent, "bytes": c.bytes, "elapsed_ms": int((time.time() - t0) * 1000),
+        "requests": c.sent, "bytes": c.bytes, "tcp_ok": True,
+        "elapsed_ms": int((time.time() - t0) * 1000),
     }
     if a.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
