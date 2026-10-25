@@ -1,4 +1,6 @@
 # php2shell toolkit v1.4
+<img width="2209" height="1122" alt="image" src="https://github.com/user-attachments/assets/f3d305f5-9ab4-4ea1-8cff-f08c5ba1afce" />
+
 
 CVE-2026-109618（PHP `session.upload_progress` 计数器悬垂指针 UAF）
 的检测、验证与利用工具集。**纯 Python 标准库实现，无第三方依赖。**
