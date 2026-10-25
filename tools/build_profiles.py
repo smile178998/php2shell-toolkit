@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""build_profiles.py — 用 symbols 的结果批量生成 profiles.json（外部 profile 库）
+"""build_profiles.py — batch-generate profiles.json (external profile library) from symbols results
 
-用法：
-  # 从本地 docker 容器提取符号，写入 profiles.json
+Usage:
+  # Extract symbols from a local docker container and write profiles.json
   python3 tools/build_profiles.py --out profiles.json \
       --from-docker 8.4.26=php2shell-8426 \
       --from-docker 8.2.35=php2shell-fixed
 
-  # 从现成 libphp.so 生成
+  # Generate from an existing libphp.so
   python3 tools/build_profiles.py --out profiles.json \
       --from-elf 8.4.26=/path/to/libphp.so --stage2-t 406
 
-  # 只打印（不落盘）
+  # Print only (do not write to disk)
   python3 tools/build_profiles.py --from-docker 8.4.26=php2shell-8426 --dry-run
 
-说明：
-  * 生成的条目只有 symbols 能给出的字段（ht_size / zif_offset / dtor_offset / htdata_offset）。
-  * htdata_offset 与 stage2_t 属于「标定」结果，符号表无法推出：htdata_offset 由 symbols 的
-    .data 扫描给出（本工具沿用），stage2_t 需用 calibrate 命中后人工回填（--stage2-t）。
-  * rce_ok 默认为 true；如该版本经实测只能 DoS，请在 profiles.json 里手工改为 false。
-  * 与内置 PROFILE_DB 同名时以内置为准（loader 不覆盖）。
+Notes:
+  * Generated entries contain only the fields symbols can provide (ht_size / zif_offset / dtor_offset / htdata_offset).
+  * htdata_offset and stage2_t are calibration results and cannot be derived from the symbol table: htdata_offset comes from symbols'
+    .data scan (this tool follows that), and stage2_t must be backfilled manually after a calibrate hit (--stage2-t).
+  * rce_ok defaults to true; if the build has been measured to only DoS, manually set it to false in profiles.json.
+  * When a name matches the built-in PROFILE_DB, the built-in one wins (the loader does not overwrite it).
 """
 import argparse
 import json
@@ -33,7 +33,7 @@ P2S = os.path.join(PKG, "attack", "p2s_ext.py")
 
 
 def run_symbols(kind, spec):
-    """kind: docker|elf ; spec: container[:path] 或 elf 路径"""
+    """kind: docker|elf ; spec: container[:path] or elf path"""
     tmp = os.path.join(PKG, ".sym.tmp.json")
     if os.path.exists(tmp):
         os.remove(tmp)
@@ -45,7 +45,7 @@ def run_symbols(kind, spec):
     cmd += ["--out", tmp]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(tmp):
-        sys.stderr.write(f"[!] symbols 失败（{kind}:{spec} rc={r.returncode}）\n")
+        sys.stderr.write(f"[!] symbols failed ({kind}:{spec} rc={r.returncode})\n")
         sys.stderr.write((r.stdout or "")[-800:] + (r.stderr or "")[-800:] + "\n")
         return None
     with open(tmp, "r", encoding="utf-8") as fh:
@@ -55,18 +55,18 @@ def run_symbols(kind, spec):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="生成 php2shell 外部 profile 库")
-    ap.add_argument("--out", default="profiles.json", help="输出文件（默认 profiles.json）")
+    ap = argparse.ArgumentParser(description="generate the php2shell external profile library")
+    ap.add_argument("--out", default="profiles.json", help="output file (default profiles.json)")
     ap.add_argument("--from-docker", action="append", default=[], metavar="VER=CONTAINER[:PATH]")
     ap.add_argument("--from-elf", action="append", default=[], metavar="VER=/path/libphp.so")
-    ap.add_argument("--stage2-t", type=int, default=None, help="回填 stage2_t（标定命中值，如 406）")
-    ap.add_argument("--rce-ok", choices=["true", "false"], default="true", help="rce_ok 默认 true")
-    ap.add_argument("--dry-run", action="store_true", help="只打印，不写文件")
+    ap.add_argument("--stage2-t", type=int, default=None, help="backfill stage2_t (calibration hit value, e.g. 406)")
+    ap.add_argument("--rce-ok", choices=["true", "false"], default="true", help="rce_ok defaults to true")
+    ap.add_argument("--dry-run", action="store_true", help="print only, do not write the file")
     a = ap.parse_args()
 
     jobs = [("docker", s) for s in a.from_docker] + [("elf", s) for s in a.from_elf]
     if not jobs:
-        ap.error("至少给一个 --from-docker 或 --from-elf")
+        ap.error("provide at least one --from-docker or --from-elf")
 
     merged = {}
     if os.path.exists(a.out) and not a.dry_run:
@@ -81,7 +81,7 @@ def main():
     ok = 0
     for kind, item in jobs:
         if "=" not in item:
-            sys.stderr.write(f"[!] 格式应为 VER=SPEC，跳过：{item}\n")
+            sys.stderr.write(f"[!] format should be VER=SPEC, skipping: {item}\n")
             continue
         ver, spec = item.split("=", 1)
         ver, spec = ver.strip(), spec.strip()
@@ -104,7 +104,7 @@ def main():
               f"zif=0x{p['zif_offset']:X} dtor=0x{p['dtor_offset']:X}")
 
     if not ok:
-        sys.stderr.write("[!] 没有任何条目生成\n")
+        sys.stderr.write("[!] no entries were generated\n")
         return 2
 
     text = json.dumps(merged, indent=2, ensure_ascii=False, sort_keys=True)
@@ -113,7 +113,7 @@ def main():
     else:
         with open(a.out, "w", encoding="utf-8") as fh:
             fh.write(text + "\n")
-        print(f"[*] 已写入 {a.out}（{len(merged)} 个 profile）")
+        print(f"[*] wrote {a.out} ({len(merged)} profiles)")
     return 0
 
 

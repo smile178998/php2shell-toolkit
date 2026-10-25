@@ -1,19 +1,19 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CVE-2026-109618 检测与利用控制台</title>
+<title>CVE-2026-109618 Detection &amp; Exploitation Console</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">
-    <h1>CVE-2026-109618 检测与利用控制台</h1>
-    <p class="sub">只做 CVE-2026-109618（PHP multipart OOM → session 悬垂 → UAF RCE）· 不含 SQLi / XSS / CSRF / LFI / CMDi 等通用 Web 扫描</p>
+    <h1>CVE-2026-109618 Detection &amp; Exploitation Console</h1>
+    <p class="sub">Covers only CVE-2026-109618 (PHP multipart OOM → dangling session → UAF RCE) · no generic web scanning for SQLi / XSS / CSRF / LFI / CMDi</p>
   </div>
   <div class="top-actions">
-    <span id="health" class="badge b-queued">连接中…</span>
+    <span id="health" class="badge b-queued">Connecting…</span>
   </div>
 </header>
 
@@ -21,75 +21,75 @@
   <section class="panel">
     <div class="row">
       <div class="col grow">
-        <label>目标 URL（每行一个，仅 http/https 根路径或入口；支持公网 IP）</label>
+        <label>Target URLs (one per line; http/https root path or entry point only; public IPs allowed)</label>
         <textarea id="targets" rows="5" spellcheck="false" placeholder="http://127.0.0.1:8090/&#10;https://example.com/index.php"></textarea>
       </div>
     </div>
 
     <div class="row">
       <div class="col">
-        <label>检测模式</label>
+        <label>Scan mode</label>
         <div class="modes">
-          <label class="chk"><input type="radio" name="mode" value="recon" checked> recon · 四前置分级（默认只读）</label>
-          <label class="chk"><input type="radio" name="mode" value="oneclick"> oneclick · 完整 RCE 链（会攻击）</label>
+          <label class="chk"><input type="radio" name="mode" value="recon" checked> recon · four-precondition triage (read-only by default)</label>
+          <label class="chk"><input type="radio" name="mode" value="oneclick"> oneclick · full RCE chain (will attack)</label>
         </div>
       </div>
       <div class="col">
-        <label>通用参数</label>
+        <label>General options</label>
         <div class="inline">
-          <span>并发 <input type="number" id="concurrency" value="16" min="1" max="64"></span>
-          <span>请求超时 <input type="number" id="timeout" value="20" min="3" max="120"></span>
-          <span>单目标超时 <input type="number" id="per_target_timeout" value="900" min="60" max="3600"></span>
-          <label class="chk"><input type="checkbox" id="insecure"> 忽略 TLS 证书（--insecure）</label>
+          <span>Concurrency <input type="number" id="concurrency" value="16" min="1" max="64"></span>
+          <span>Request timeout <input type="number" id="timeout" value="20" min="3" max="120"></span>
+          <span>Per-target timeout <input type="number" id="per_target_timeout" value="900" min="60" max="3600"></span>
+          <label class="chk"><input type="checkbox" id="insecure"> Ignore TLS certificate (--insecure)</label>
         </div>
       </div>
     </div>
 
     <div class="row">
       <div class="col" id="recon-opts">
-        <label>recon 选项</label>
+        <label>recon options</label>
         <div class="inline">
-          <label class="chk"><input type="checkbox" id="fast" checked> 快速模式（只查首页，少发包）</label>
-          <label class="chk"><input type="checkbox" id="deep"> 深度探测（发送 OOM 载荷，慢，可能 5xx）</label>
+          <label class="chk"><input type="checkbox" id="fast" checked> Fast mode (home page only, fewer requests)</label>
+          <label class="chk"><input type="checkbox" id="deep"> Deep probing (send OOM payloads; slow, may return 5xx)</label>
           <span>budget <input type="number" id="budget" value="6" min="1" max="8"></span>
           <span>delay <input type="number" id="delay" value="0.3" min="0" max="10" step="0.1"></span>
           <span>probe-sizes <input type="text" id="probe_sizes" value="0.5,1,2,4,8,16" size="16"></span>
         </div>
       </div>
       <div class="col" id="attack-opts">
-        <label>oneclick 选项（命令硬上限 14 字节）</label>
+        <label>oneclick options (hard command limit 14 bytes)</label>
         <div class="inline">
           <span>rounds <input type="number" id="rounds" value="6" min="1" max="20"></span>
           <span>tries <input type="number" id="tries" value="2" min="1" max="5"></span>
           <span>only <input type="text" id="only" value="id" maxlength="14" size="10"></span>
         </div>
-        <label class="chk warn"><input type="checkbox" id="attack_ack"> 我确认执行攻击（真实发送利用链并回读 proof）</label>
+        <label class="chk warn"><input type="checkbox" id="attack_ack"> I confirm attack execution (really send the exploit chain and read back proof)</label>
       </div>
     </div>
 
     <div class="row actions">
-      <button id="start" class="primary">开始</button>
-      <button id="stop" disabled>停止</button>
+      <button id="start" class="primary">Start</button>
+      <button id="stop" disabled>Stop</button>
       <span class="spacer"></span>
-      <a id="exp-json" class="btn" href="#" download>导出 JSON</a>
-      <a id="exp-csv" class="btn" href="#" download>导出 CSV</a>
-      <button id="recent" class="ghost">载入最近作业</button>
+      <a id="exp-json" class="btn" href="#" download>Export JSON</a>
+      <a id="exp-csv" class="btn" href="#" download>Export CSV</a>
+      <button id="recent" class="ghost">Load recent job</button>
     </div>
   </section>
 
   <section class="stats">
-    <div class="stat"><span class="k">作业</span><b id="s-job">-</b></div>
-    <div class="stat"><span class="k">目标</span><b id="s-total">0</b></div>
-    <div class="stat"><span class="k">已完成</span><b id="s-done">0</b></div>
-    <div class="stat sev-critical"><span class="k">RCE 确认</span><b id="s-rce">0</b></div>
-    <div class="stat sev-high"><span class="k">可能可打 / DoS</span><b id="s-likely">0</b></div>
-    <div class="stat"><span class="k">未受影响/未知</span><b id="s-clean">0</b></div>
+    <div class="stat"><span class="k">Job</span><b id="s-job">-</b></div>
+    <div class="stat"><span class="k">Targets</span><b id="s-total">0</b></div>
+    <div class="stat"><span class="k">Completed</span><b id="s-done">0</b></div>
+    <div class="stat sev-critical"><span class="k">RCE confirmed</span><b id="s-rce">0</b></div>
+    <div class="stat sev-high"><span class="k">Likely exploitable / DoS</span><b id="s-likely">0</b></div>
+    <div class="stat"><span class="k">Not affected / unknown</span><b id="s-clean">0</b></div>
   </section>
 
   <section class="toolbar">
-    <input type="search" id="q" placeholder="搜索目标 / 版本 / 证据">
+    <input type="search" id="q" placeholder="Search targets / versions / evidence">
     <select id="f-verdict">
-      <option value="">全部结论</option>
+      <option value="">All verdicts</option>
       <option>RCE_CONFIRMED</option>
       <option>RCE_LIKELY</option>
       <option>DOS_ONLY</option>
@@ -105,7 +105,7 @@
       <option>DENIED</option>
     </select>
     <select id="f-status">
-      <option value="">全部状态</option>
+      <option value="">All statuses</option>
       <option>queued</option><option>running</option><option>found</option>
       <option>likely</option><option>dos</option><option>clean</option>
       <option>unknown</option><option>no_sink</option><option>denied</option><option>error</option><option>stopped</option>
@@ -118,24 +118,24 @@
     <table>
       <thead>
         <tr>
-          <th class="c">#</th><th>目标</th><th>模式</th><th>结论</th><th class="c">rc</th>
-          <th>PHP</th><th>关键证据</th><th>状态</th>
+          <th class="c">#</th><th>Target</th><th>Mode</th><th>Verdict</th><th class="c">rc</th>
+          <th>PHP</th><th>Key evidence</th><th>Status</th>
         </tr>
       </thead>
-      <tbody id="rows"><tr class="empty"><td colspan="8">尚无目标</td></tr></tbody>
+      <tbody id="rows"><tr class="empty"><td colspan="8">No targets yet</td></tr></tbody>
     </table>
   </div>
 
   <section class="detail hidden" id="detail">
     <div class="detail-head">
       <h3 id="d-url">-</h3>
-      <button class="ghost" id="d-close">关闭</button>
+      <button class="ghost" id="d-close">Close</button>
     </div>
     <div class="meta" id="d-meta"></div>
     <div id="d-findings"></div>
-    <div class="sect-title">证据（CVE-2026-109618 专用）</div>
+    <div class="sect-title">Evidence (CVE-2026-109618 specific)</div>
     <pre class="log" id="d-evidence">-</pre>
-    <div class="sect-title">执行日志（尾部）</div>
+    <div class="sect-title">Execution log (tail)</div>
     <pre class="log" id="d-log">-</pre>
   </section>
 </main>

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-discover.py -- CVE-2026-109618 资产发现与版本判定（Shodan / FOFA）
+discover.py -- CVE-2026-109618 asset discovery and version determination (Shodan / FOFA)
 
-职责边界（重要）
-----------------
-本模块只做两件事：
-  1) 通过 Shodan / FOFA 的**公开检索 API** 收集候选资产（被动，不接触目标）
-  2) 可选地对候选做**一次**普通 GET，读取 X-Powered-By / Server 头，判定 PHP 版本
-     → 只为了「按版本筛选」，不做任何 OOM / 变形请求
+Responsibility boundary (important)
+-----------------------------------
+This module does only two things:
+  1) Gather candidate assets via the **public search APIs** of Shodan / FOFA (passive, no contact with the target)
+  2) Optionally perform **one** plain GET against a candidate, read the X-Powered-By / Server headers, and determine the PHP version
+     -> only for "filtering by version"; no OOM / malformed requests of any kind
 
-它**不会**对检索结果自动发起漏洞探测或利用。
-对某个 IP 做 scan/exploit 之前，你必须自己确认对该 IP 有授权。
+It does **not** automatically launch vulnerability probing or exploitation against search results.
+Before you scan/exploit an IP, you must confirm yourself that you hold authorization for that IP.
 
-仅依赖标准库。
+Standard library only.
 """
 
 import base64
@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 
 # ---------------------------------------------------------------------------
-# 受影响版本矩阵：8.2 < 8.2.35 / 8.3 < 8.3.36 / 8.4 < 8.4.27 / 8.5 < 8.5.12
+# Affected version matrix: 8.2 < 8.2.35 / 8.3 < 8.3.36 / 8.4 < 8.4.27 / 8.5 < 8.5.12
 # ---------------------------------------------------------------------------
 AFFECTED_MAX = {
     (8, 2): 35,
@@ -39,7 +39,7 @@ AFFECTED_MAX = {
 
 VER_RE = re.compile(rb'PHP/(\d+)\.(\d+)\.(\d+)')
 VER_RE_STR = re.compile(r'PHP/(\d+)\.(\d+)\.(\d+)')
-# phpinfo 页面形态：<tr><td class="e">PHP Version </td><td class="v">8.2.12 </td>
+# phpinfo page shape: <tr><td class="e">PHP Version </td><td class="v">8.2.12 </td>
 VER_INFO_RE = re.compile(rb'PHP\s*Version\s*(?:</td>\s*<td[^>]*>\s*)?(\d+)\.(\d+)\.(\d+)')
 VER_INFO_RE_STR = re.compile(r'PHP\s*Version\s*(?:</td>\s*<td[^>]*>\s*)?(\d+)\.(\d+)\.(\d+)')
 
@@ -47,14 +47,14 @@ DEFAULT_UA = 'php2shell-discover/1.0'
 
 
 # ---------------------------------------------------------------------------
-# 版本判定
+# Version determination
 # ---------------------------------------------------------------------------
 def parse_php_version(text):
-    """从任意文本/字节里抽 PHP 版本，返回 'x.y.z' 或 None。
+    """Extract a PHP version from arbitrary text/bytes, return 'x.y.z' or None.
 
-    覆盖两种常见形态：
+    Covers two common shapes:
       Header / banner : Server: Apache/2.4 X-Powered-By: PHP/8.4.26
-      phpinfo / 页面  : <td>PHP Version </td><td>8.2.12</td>
+      phpinfo / page  : <td>PHP Version </td><td>8.2.12</td>
     """
     if text is None:
         return None
@@ -78,30 +78,30 @@ def version_tuple(ver):
 
 def judge(ver):
     """
-    返回 (verdict, note)
-      AFFECTED   明确落在受影响区间
-      PATCHED    明确已修复
-      UNKNOWN    版本号无法解析，或超出已知矩阵（需人工查手册）
+    Return (verdict, note)
+      AFFECTED   clearly inside the affected range
+      PATCHED    clearly patched
+      UNKNOWN    version string cannot be parsed, or outside the known matrix (check the manual by hand)
     """
     t = version_tuple(ver)
     if not t or len(t) < 3:
-        return 'UNKNOWN', '版本未知'
+        return 'UNKNOWN', 'version unknown'
     major, minor, patch = t[0], t[1], t[2]
     if major != 8:
-        return 'UNKNOWN', '非 8.x，本矩阵未覆盖'
+        return 'UNKNOWN', 'not 8.x, this matrix does not cover it'
     limit = AFFECTED_MAX.get((major, minor))
     if limit is None:
-        return 'UNKNOWN', '8.%d.x 不在已知矩阵内' % minor
+        return 'UNKNOWN', '8.%d.x is not in the known matrix' % minor
     if patch < limit:
-        return 'AFFECTED', '需 < 8.%d.%d，实测 8.%d.%d' % (minor, limit, minor, patch)
-    return 'PATCHED', '已修复（需 < 8.%d.%d，实测 8.%d.%d）' % (minor, limit, minor, patch)
+        return 'AFFECTED', 'requires < 8.%d.%d, measured 8.%d.%d' % (minor, limit, minor, patch)
+    return 'PATCHED', 'patched (requires < 8.%d.%d, measured 8.%d.%d)' % (minor, limit, minor, patch)
 
 
 # ---------------------------------------------------------------------------
-# 检索式构造
+# Search-query construction
 # ---------------------------------------------------------------------------
 def shodan_query(php_version=None, extra=None):
-    """构造 Shodan 检索式。"""
+    """Build a Shodan search query."""
     parts = []
     if php_version:
         parts.append('"PHP/%s"' % php_version)
@@ -113,7 +113,7 @@ def shodan_query(php_version=None, extra=None):
 
 
 def fofa_query(php_version=None, extra=None):
-    """构造 FOFA 检索式（语法：header="..." / body="..."）。"""
+    """Build a FOFA search query (syntax: header="..." / body="...")."""
     if php_version:
         q = 'header="X-Powered-By: PHP/%s"' % php_version
     else:
@@ -124,7 +124,7 @@ def fofa_query(php_version=None, extra=None):
 
 
 # ---------------------------------------------------------------------------
-# HTTP 基础
+# HTTP basics
 # ---------------------------------------------------------------------------
 def _http_get(url, timeout=20.0, headers=None, proxy=None):
     req = urllib.request.Request(url, headers=headers or {'User-Agent': DEFAULT_UA})
@@ -145,8 +145,8 @@ def _http_get(url, timeout=20.0, headers=None, proxy=None):
 # ---------------------------------------------------------------------------
 def shodan_search(api_key, query, pages=1, timeout=20.0, proxy=None):
     """
-    返回 (matches, error)。每个 match 归一化为 dict。
-    注意：Shodan 每页 100 条，1 次 query credit / 100 结果。
+    Return (matches, error). Each match is normalized into a dict.
+    Note: Shodan returns 100 per page, 1 query credit / 100 results.
     """
     out = []
     for page in range(1, max(1, pages) + 1):
@@ -155,13 +155,13 @@ def shodan_search(api_key, query, pages=1, timeout=20.0, proxy=None):
         try:
             status, _h, body = _http_get(url, timeout=timeout, proxy=proxy)
         except Exception as e:
-            return out, 'Shodan 请求失败: %s' % e
+            return out, 'Shodan request failed: %s' % e
         try:
             data = json.loads(body.decode('utf-8', 'replace'))
         except ValueError:
-            return out, 'Shodan 返回非 JSON: %s' % body[:200]
+            return out, 'Shodan returned non-JSON: %s' % body[:200]
         if 'error' in data:
-            return out, 'Shodan 错误: %s' % data['error']
+            return out, 'Shodan error: %s' % data['error']
         matches = data.get('matches') or []
         for m in matches:
             out.append({
@@ -182,22 +182,22 @@ def shodan_search(api_key, query, pages=1, timeout=20.0, proxy=None):
 def shodan_count(api_key, query, facets='country:8,port:10,product:6,version:6',
                  timeout=20.0, proxy=None):
     """
-    只读统计：调用 /shodan/host/count，返回 (stats, error)。
+    Read-only statistics: calls /shodan/host/count and returns (stats, error).
     stats = {'total': int, 'facets': {name: [{value, count}, ...]}, 'query': str}
-    刻意不返回任何主机 IP —— 用于了解某类指纹在全网的分布，不产出攻击目标清单。
+    Deliberately returns no host IPs -- meant to understand the global distribution of a fingerprint, not to produce an attack target list.
     """
     url = 'https://api.shodan.io/shodan/host/count?' + urllib.parse.urlencode(
         {'key': api_key, 'query': query, 'facets': facets})
     try:
         status, _h, body = _http_get(url, timeout=timeout, proxy=proxy)
     except Exception as e:
-        return None, 'Shodan 请求失败: %s' % e
+        return None, 'Shodan request failed: %s' % e
     try:
         data = json.loads(body.decode('utf-8', 'replace'))
     except ValueError:
-        return None, 'Shodan 返回非 JSON(HTTP %s): %s' % (status, body[:200])
+        return None, 'Shodan returned non-JSON (HTTP %s): %s' % (status, body[:200])
     if 'error' in data:
-        return None, 'Shodan 错误: %s' % data['error']
+        return None, 'Shodan error: %s' % data['error']
     facets_out = {}
     for name, rows in (data.get('facets') or {}).items():
         if isinstance(rows, list):
@@ -210,7 +210,7 @@ def shodan_count(api_key, query, facets='country:8,port:10,product:6,version:6',
 # FOFA
 # ---------------------------------------------------------------------------
 def fofa_search(api_key, query, size=100, timeout=20.0, proxy=None, email=None):
-    """返回 (rows, error)。"""
+    """Return (rows, error)."""
     qb = base64.b64encode(query.encode('utf-8')).decode('ascii')
     params = {'key': api_key, 'qbase64': qb, 'size': min(max(size, 1), 10000),
               'fields': 'host,ip,port,server,title,header'}
@@ -220,16 +220,16 @@ def fofa_search(api_key, query, size=100, timeout=20.0, proxy=None, email=None):
     try:
         status, _h, body = _http_get(url, timeout=timeout, proxy=proxy)
     except Exception as e:
-        return [], 'FOFA 请求失败: %s' % e
+        return [], 'FOFA request failed: %s' % e
     try:
         data = json.loads(body.decode('utf-8', 'replace'))
     except ValueError:
-        return [], 'FOFA 返回非 JSON: %s' % body[:200]
+        return [], 'FOFA returned non-JSON: %s' % body[:200]
     if data.get('error'):
-        return [], 'FOFA 错误: %s' % (data.get('errmsg') or data.get('error'))
+        return [], 'FOFA error: %s' % (data.get('errmsg') or data.get('error'))
     rows = []
     for item in (data.get('results') or []):
-        # fields 顺序: host,ip,port,server,title,header
+        # fields order: host,ip,port,server,title,header
         if isinstance(item, dict):
             host, ip, port = item.get('host'), item.get('ip'), item.get('port')
             server, title, header = item.get('server'), item.get('title'), item.get('header')
@@ -246,7 +246,7 @@ def fofa_search(api_key, query, size=100, timeout=20.0, proxy=None, email=None):
 
 
 # ---------------------------------------------------------------------------
-# 归一化 / 去重 / 被动指纹
+# Normalization / dedupe / passive fingerprinting
 # ---------------------------------------------------------------------------
 def to_url(item, scheme=None):
     if item.get('host'):
@@ -265,8 +265,8 @@ def to_url(item, scheme=None):
 
 def passive_fingerprint(url, timeout=10.0, proxy=None, verify_tls=False):
     """
-    对候选做一次普通 GET，只读响应头/前 64KB 里的版本串。
-    这是唯一会接触目标的动作，且不带任何变形 payload。
+    Perform one plain GET against a candidate; read the version string only from the response headers / first 64KB.
+    This is the only action that touches the target, and it carries no malformed payload.
     """
     res = {'url': url, 'status': None, 'server': None, 'xpb': None,
            'php_ver': None, 'error': None}
@@ -288,7 +288,7 @@ def passive_fingerprint(url, timeout=10.0, proxy=None, verify_tls=False):
 
 
 def enrich(items, timeout=10.0, proxy=None, limit=None):
-    """给候选补上指纹与判定。limit=None 表示全部。"""
+    """Add fingerprints and verdicts to candidates. limit=None means all of them."""
     n = 0
     for it in items:
         if limit is not None and n >= limit:
@@ -317,7 +317,7 @@ def dedupe(items):
 
 
 # ---------------------------------------------------------------------------
-# 输出
+# Output
 # ---------------------------------------------------------------------------
 def render(items, only_affected=False):
     hdr = '%-6s %-16s %-6s %-26s %-10s %-9s %s' % (
@@ -340,7 +340,7 @@ def render(items, only_affected=False):
             v[:9],
             (it.get('probe', {}).get('server') or it.get('server') or '')[:28]))
     print()
-    print('合计 %d 条，其中 AFFECTED %d 条' % (len(items), n_aff))
+    print('total %d entries, of which AFFECTED %d' % (len(items), n_aff))
     return n_aff
 
 
@@ -358,7 +358,7 @@ def emit_targets(items, path, only_affected=True):
 
 
 # ---------------------------------------------------------------------------
-# 离线导入（--from-json）：便于缓存结果 / 无 key 时复算
+# Offline import (--from-json): handy for caching results / recomputing without keys
 # ---------------------------------------------------------------------------
 def load_from_json(path):
     with open(path, 'r', encoding='utf-8', errors='replace') as fh:

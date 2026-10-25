@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CVE-2026-109618 批量评估控制台（本地 Web GUI，零第三方依赖）
+"""CVE-2026-109618 batch assessment console (local web GUI, zero third-party dependencies)
 
-用法:
+Usage:
     python3 gui/server.py --host 127.0.0.1 --port 8899
-    浏览器打开 http://127.0.0.1:8899
+    open http://127.0.0.1:8899 in a browser
 
-设计要点:
-- 本工具**只做 CVE-2026-109618**：不含 SQLi/XSS/CSRF/LFI/命令注入等任何通用 Web 扫描；
-- 引擎只有 attack/p2s_ext.py，每个目标一个子进程（崩溃/超时隔离），可配并发；
-- 两种模式：
-    recon     四前置分级（版本/消费点/post_max>memory_limit/堆可标定），默认只读；
-              勾选「深度探测」才发 OOM 落点探测（最大 16MB body，可能 5xx）；
-    oneclick  真实 RCE 链（需再勾选「确认执行攻击」）：Stage-1/2 泄漏 + 伪造 HashTable +
-              短命令执行 + HTTP 回读 proof，结果取 oneclick_report.json；
-- 不做任何地址范围校验：粘贴的目标直接进入队列，公网 IP 也可直接使用；
-- 所有结果落盘到 gui_runs/<job_id>/，支持 JSON / CSV 导出。
+Design notes:
+- This tool does **only CVE-2026-109618**: it contains no generic web scanning such as SQLi/XSS/CSRF/LFI/command injection;
+- The only engine is attack/p2s_ext.py; each target runs in its own subprocess (crash/timeout isolation) and concurrency is configurable;
+- Two modes:
+    recon     four-precondition triage (version/sink/post_max>memory_limit/heap calibratable), read-only by default;
+              OOM impact probing is sent only when "Deep probing" is checked (up to 16MB body, may return 5xx);
+    oneclick  real RCE chain (also requires "Confirm attack execution"): Stage-1/2 leak + fake HashTable +
+              short command execution + HTTP readback of proof; results come from oneclick_report.json;
+- No address-range validation is performed: pasted targets go straight into the queue, public IPs can be used directly;
+- All results are written to gui_runs/<job_id>/ and can be exported as JSON / CSV.
 """
 import argparse
 import csv
@@ -40,7 +40,7 @@ P2S = os.path.join(ROOT, "attack", "p2s_ext.py")
 PY = sys.executable or "python3"
 
 def _max_workers():
-    """GUI 并发上限：环境变量 P2S_MAX_WORKERS（默认 32，硬上限 64）。"""
+    """GUI concurrency cap: environment variable P2S_MAX_WORKERS (default 32, hard cap 64)."""
     try:
         n = int(os.environ.get("P2S_MAX_WORKERS", "32") or 32)
     except ValueError:
@@ -55,7 +55,7 @@ SEV_ORDER = ["critical", "high", "medium", "low", "info"]
 
 
 def load_snapshot(jid):
-    """服务重启后仍可查看历史任务：从 gui_runs/<job_id>/report.json 读取"""
+    """Keep past jobs visible after a restart: read them from gui_runs/<job_id>/report.json"""
     if not re.match(r"^[\w.-]+$", jid or ""):
         return None
     p = os.path.join(WORKROOT, jid, "report.json")
@@ -69,9 +69,9 @@ def load_snapshot(jid):
 
 
 
-# ------------------------------------------------------------------ 工具函数
+# ------------------------------------------------------------------ helpers
 def _host_of(target):
-    """从 URL / host:port / [v6]:port 中取出纯主机名或 IP"""
+    """Extract the bare hostname or IP from a URL / host:port / [v6]:port"""
     t = (target or "").strip()
     if "://" in t:
         t = t.split("://", 1)[1]
@@ -88,7 +88,7 @@ def _host_of(target):
 
 
 def is_public_host(host):
-    """公网判定：非回环/私网/链路本地/link-local 视为公网"""
+    """Public-host test: anything that is not loopback/private/link-local counts as public"""
     if not host:
         return False
     h = _host_of(host).strip("[]").lower()
@@ -99,14 +99,14 @@ def is_public_host(host):
         if not ips:
             ips = [socket.gethostbyname(h)]
     except Exception:
-        # 解析失败按公网处理（更保守）
+        # If parsing fails, treat it as public (more conservative)
         return True
     for ip in ips:
         try:
             a = ipaddress.ip_address(ip)
         except ValueError:
             return True
-        if not a.is_global:  # 回环/私网/链路本地/保留/文档段(TEST-NET) 一律视为非公网
+        if not a.is_global:  # loopback/private/link-local/reserved/documentation (TEST-NET) are all treated as non-public
             return False
     return True
 
@@ -117,12 +117,12 @@ def normalize_target(raw):
         return None
     if "://" not in t:
         t = "http://" + t
-    # 裸 IPv6 必须加方括号，否则 urlparse 会把第一段当 host、其余当 port
+    # A bare IPv6 address must be bracketed, otherwise urlparse treats the first segment as host and the rest as port
     try:
         rest = t.split("://", 1)[1]
         authority = re.split(r"[/?#]", rest, 1)[0]
         if authority.count(":") >= 2 and not authority.startswith("["):
-            ipaddress.ip_address(authority)  # 仅 IPv6 会通过
+            ipaddress.ip_address(authority)  # only IPv6 gets here
             t = t.replace(authority, "[%s]" % authority, 1)
     except ValueError:
         pass
@@ -130,7 +130,7 @@ def normalize_target(raw):
 
 
 def cve_verdict(rc, mode):
-    """把 CLI 退出码映射成 CVE-2026-109618 专用结论。"""
+    """Map a CLI exit code to a CVE-2026-109618-specific verdict."""
     if mode == "oneclick":
         return {0: "RCE_CONFIRMED", 10: "RCE_LIKELY", 20: "DOS_ONLY", 30: "NOT_AFFECTED",
                 40: "NO_SINK", 50: "UNREACHABLE", 3: "DENIED"}.get(rc, "UNKNOWN")
@@ -148,7 +148,7 @@ def cve_severity(rc):
 
 
 def synth_cve(log, rc, url, mode, report, err):
-    """把 recon/oneclick 的 JSON 报告或退出码转成 GUI 目标记录。"""
+    """Turn a recon/oneclick JSON report or exit code into a GUI target record."""
     report = report if isinstance(report, dict) else {}
     verdict = report.get("verdict") or cve_verdict(rc, mode)
     ver = report.get("php_version") or report.get("version") or ""
@@ -178,13 +178,13 @@ def synth_cve(log, rc, url, mode, report, err):
         ev["post_max_hit_mb"] = d.get("post_max_hit_mb")
     desc = "[%s] %s → %s (exit %s)" % (mode, url, verdict, rc)
     if ev["version"]:
-        desc += "；PHP %s" % ev["version"]
+        desc += "; PHP %s" % ev["version"]
     if ev.get("oom_at_mb") is not None:
-        desc += "；OOM@%sMB" % ev["oom_at_mb"]
+        desc += "; OOM@%sMB" % ev["oom_at_mb"]
     if ev.get("post_max_gt_memory"):
-        desc += "；post_max>memory_limit"
+        desc += "; post_max>memory_limit"
     if ev["proof_body"]:
-        desc += "；proof=%s" % ev["proof_body"].replace("\n", " ")[:120]
+        desc += "; proof=%s" % ev["proof_body"].replace("\n", " ")[:120]
     finding = {
         "type": "cve-2026-109618",
         "title": "CVE-2026-109618 %s" % verdict,
@@ -237,7 +237,7 @@ class Job(object):
         self.total = len(self.targets)
         self._t0 = time.time()
 
-    # ---- 单目标执行
+    # ---- per-target execution
     def _run_one(self, tgt):
         if self.stop_flag.is_set():
             with self.lock:
@@ -248,7 +248,7 @@ class Job(object):
         if not url:
             with self.lock:
                 tgt["status"] = "skipped"
-                tgt["error"] = "空行/注释"
+                tgt["error"] = "blank line/comment"
             return
         host = (urlparse(url).hostname or "").lower()
         pub = is_public_host(host)
@@ -273,7 +273,7 @@ class Job(object):
             report_path = os.path.join(self.dir, name + ".recon.json")
             cmd = py + ["recon"] + args + ["--json"]
             if o.get("fast"):
-                # 快速初筛：只查首页版本 + 2 个 sink，约 3 个请求
+                # Fast first pass: check home page version + 2 sinks only, about 3 requests
                 cmd.append("--fast")
             elif o.get("deep"):
                 cmd += ["--deep", "--budget", str(o.get("budget") or 6),
@@ -294,11 +294,11 @@ class Job(object):
         _pt = int(o.get("per_target_timeout") or 900)
         rc, log = self._exec(cmd, log_path, _pt)
         if "[TIMEOUT]" in log:
-            # 子进程被 per-target timeout 杀掉，报告文件通常还没写出来；
-            # 不要再把 FileNotFoundError 当成“报告错误”展示。
+            # The subprocess was killed by the per-target timeout; the report file usually does not exist yet;
+            # do not show FileNotFoundError as a "report error" any more.
             return {
                 "status": "error", "rc": 2, "verdict": "TIMEOUT",
-                "summary": "[%s] %s → TIMEOUT（超过 %ss，进程已终止，未生成报告）"
+                "summary": "[%s] %s → TIMEOUT (exceeded %ss, process terminated, no report generated)"
                            % (mode, url, _pt),
                 "findings": [],
                 "evidence": {"mode": mode, "verdict": "TIMEOUT",
@@ -309,7 +309,7 @@ class Job(object):
         return synth_cve(log, rc, url, mode, report, perr)
 
     def _load_report(self, path, log):
-        """优先读报告文件；失败则从 stdout 抽取最后一个 JSON 对象。"""
+        """Prefer the report file; if that fails, extract the last JSON object from stdout."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f), ""
@@ -320,7 +320,7 @@ class Job(object):
             try:
                 return json.loads(log[i:j + 1]), ""
             except Exception as e2:
-                err += " / stdout JSON 解析失败: %s" % e2
+                err += " / stdout JSON parse failed: %s" % e2
         return None, err
 
     def _exec(self, cmd, log_path, timeout):
@@ -331,7 +331,7 @@ class Job(object):
             rc = p.returncode
         except subprocess.TimeoutExpired as e:
             out = ((e.stdout or b"").decode("utf-8", "replace")
-                   + "\n[TIMEOUT] 超过 %ss，已终止" % timeout)
+                   + "\n[TIMEOUT] exceeded %ss, terminated" % timeout)
             rc = 2
         except Exception as e:
             out, rc = "[EXEC ERROR] %s" % e, 2
@@ -340,7 +340,7 @@ class Job(object):
         return rc, out
 
     def run(self):
-        # 并发上限可配：P2S_MAX_WORKERS（默认 16，硬上限 64），避免硬编码 8 拖慢大批量
+        # Concurrency cap is configurable: P2S_MAX_WORKERS (default 16, hard cap 64), so a hard-coded 8 does not slow down large batches
         workers = max(1, min(_max_workers(), int(self.opts.get("concurrency", 8))))
         print("[job] workers=%d targets=%d mode=%s" % (workers, len(self.targets), self.opts.get("mode")), flush=True)
         try:
@@ -366,7 +366,7 @@ class Job(object):
     def stop(self):
         self.stop_flag.set()
 
-    # ---- 快照
+    # ---- snapshot
     def snapshot(self, with_log=True):
         sev = {k: 0 for k in SEV_ORDER}
         types = {}
@@ -489,11 +489,11 @@ class Handler(BaseHTTPRequestHandler):
     _SELF_SCOPE_RE = re.compile(r"\b(?:net|org|hostname|asn):", re.I)
 
     def _shodan_import(self):
-        """从 Shodan 导入「自有资产」候选目标。
+        """Import "own asset" candidate targets from Shodan.
 
-        强制要求检索语句带 net:/org:/hostname:/asn: 限定，避免把公开引擎
-        变成「全网挑选第三方受害者」的批量攻击入口；导入结果只是候选清单，
-        是否扫描仍需你显式操作（不会自动入队）。
+        The query is required to carry a net:/org:/hostname:/asn: qualifier, so a public search engine
+        cannot become a batch attack entry point for "picking third-party victims across the internet"; the import result is only a candidate list,
+        and scanning still needs your explicit action (it is never queued automatically).
         """
         b = self._body()
         key = (b.get("api_key") or os.environ.get("SHODAN_API_KEY") or "").strip()
@@ -505,16 +505,16 @@ class Handler(BaseHTTPRequestHandler):
             limit = 50
         limit = max(1, min(200, limit))
         if not q:
-            return self._send(400, {"error": 'query 必填，例如 net:203.0.113.0/24 或 org:"你的公司名"'})
-        # 导入目标清单必须限定自有资产；stats_only 只回聚合计数，不产生任何 IP，因此放行任意 query
+            return self._send(400, {"error": 'query is required, e.g. net:203.0.113.0/24 or org:"your company name"'})
+        # Importing a target list must be limited to own assets; stats_only returns aggregate counts only and produces no IPs, so any query is allowed
         if not stats_only and not self._SELF_SCOPE_RE.search(q):
             return self._send(400, {
-                "error": 'Shodan 检索必须限定自有资产：请包含 net:/org:/hostname:/asn: 过滤条件。'
-                         '本工具不提供“全网自动挑选可 RCE 第三方主机”的能力。'
-                         '若只想了解某类指纹的分布，可勾选“仅统计（不返回 IP）”。',
+                "error": 'Shodan search must be limited to own assets: include a net:/org:/hostname:/asn: filter. '
+                         'This tool does not provide the ability to "automatically pick third-party hosts with RCE across the internet". '
+                         'If you only want to see the distribution of a fingerprint, check "statistics only (no IPs returned)".',
                 "query": q})
         if not key:
-            return self._send(400, {"error": "缺少 Shodan API Key（也可 export SHODAN_API_KEY=...）"})
+            return self._send(400, {"error": "Missing Shodan API key (you can also export SHODAN_API_KEY=...)"})
         if b.get("dry_run"):
             return self._send(200, {"dry_run": True, "query": q,
                                     "limit": limit, "stats_only": stats_only})
@@ -530,15 +530,15 @@ class Handler(BaseHTTPRequestHandler):
                 pages = max(1, min(5, (limit + 99) // 100))
                 matches, err = shodan_search(key, q, pages=pages, timeout=25)
         except Exception as e:
-            return self._send(502, {"error": "Shodan 查询异常: %s" % e})
+            return self._send(502, {"error": "Shodan query error: %s" % e})
         if err:
-            return self._send(502, {"error": "Shodan 查询失败: %s" % err})
+            return self._send(502, {"error": "Shodan query failed: %s" % err})
         if stats_only:
-            # 只返回聚合计数，绝不返回主机地址
+            # Return aggregate counts only, never host addresses
             return self._send(200, {"query": q, "stats_only": True,
                                     "total": (stats or {}).get("total", 0),
                                     "facets": (stats or {}).get("facets", {}),
-                                    "note": "统计模式不返回任何 IP/端口，仅用于了解指纹分布"})
+                                    "note": "statistics mode returns no IPs/ports; it is only for understanding fingerprint distribution"})
         rows, seen = [], set()
         for m in matches or []:
             ip = m.get("ip") or m.get("ip_str")
@@ -566,22 +566,22 @@ class Handler(BaseHTTPRequestHandler):
             raw_targets = re.split(r"[\r\n,;]+", raw_targets)
         targets = [t.strip() for t in raw_targets if t and t.strip() and not t.strip().startswith("#")]
         if not targets:
-            return self._send(400, {"error": "目标列表为空"})
-        # 目标数量默认不限制（0/未设置=不限）；如需限流可设环境变量 P2S_MAX_TARGETS
-        targets = list(dict.fromkeys(targets))  # 去重，保持输入顺序
+            return self._send(400, {"error": "target list is empty"})
+        # Target count is unlimited by default (0/unset = unlimited); set P2S_MAX_TARGETS to rate-limit
+        targets = list(dict.fromkeys(targets))  # deduplicate, keep input order
         try:
             max_targets = int(os.environ.get("P2S_MAX_TARGETS", "0") or 0)
         except ValueError:
             max_targets = 0
         if max_targets > 0 and len(targets) > max_targets:
-            return self._send(400, {"error": "单次最多 %d 个目标（P2S_MAX_TARGETS 可调），请分批" % max_targets,
+            return self._send(400, {"error": "at most %d targets per request (P2S_MAX_TARGETS can be adjusted), please split the batch" % max_targets,
                                     "target_count": len(targets)})
         mode = (b.get("mode") or "recon").lower()
         if mode not in ("recon", "oneclick"):
             mode = "recon"
         attack_ack = bool(b.get("attack_ack"))
         if mode == "oneclick" and not attack_ack:
-            return self._send(400, {"error": "oneclick 会真实发起 RCE 利用，需勾选「我确认执行攻击（生成/回读 proof）」"})
+            return self._send(400, {"error": "oneclick really launches RCE exploitation; check \"I confirm attack execution (generate/read back proof)\""})
         opts = {
             "mode": mode,
             "attack_ack": attack_ack,
@@ -628,19 +628,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CVE-2026-109618 批量指纹与只读评估 GUI 控制台")
+    ap = argparse.ArgumentParser(description="CVE-2026-109618 batch fingerprint and read-only assessment GUI console")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8899)
     a = ap.parse_args()
     os.makedirs(WORKROOT, exist_ok=True)
     if not os.path.isfile(P2S):
-        sys.exit("找不到 attack/p2s_ext.py，请从工具包根目录运行")
+        sys.exit("cannot find attack/p2s_ext.py; run from the toolkit root")
     try:
         srv = ThreadingHTTPServer((a.host, a.port), Handler)
     except OSError as e:
-        sys.exit("端口 %d 绑定失败（%s）。换端口重试：--port 8899" % (a.port, e))
-    print("CVE-2026-109618 评估 GUI: http://%s:%d" % (a.host, a.port))
-    print("结果目录: %s" % WORKROOT)
+        sys.exit("failed to bind port %d (%s). Try another port: --port 8899" % (a.port, e))
+    print("CVE-2026-109618 assessment GUI: http://%s:%d" % (a.host, a.port))
+    print("Results directory: %s" % WORKROOT)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

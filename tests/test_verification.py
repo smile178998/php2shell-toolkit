@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""成功判据的回归测试：proof 必须是本次新写入且内容匹配，回读必须排除软 404。"""
+"""Regression tests for the success criteria: proof must be newly written this run and content must match; readback must exclude soft 404."""
 import os
 import sys
 import tempfile

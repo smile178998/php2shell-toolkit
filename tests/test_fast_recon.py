@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""快速侦察回归：--fast 只发 3 个请求，且与 --deep 互斥。"""
+"""Fast recon regression: --fast sends only 3 requests and is mutually exclusive with --deep."""
 import contextlib
 import io
 import json

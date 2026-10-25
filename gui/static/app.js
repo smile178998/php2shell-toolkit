@@ -1,4 +1,4 @@
-/* CVE-2026-109618 控制台前端（recon / oneclick 双模式，无通用 Web 扫描） */
+/* CVE-2026-109618 console front-end (recon / oneclick dual mode, no generic web scanning) */
 (function () {
   "use strict";
 
@@ -77,7 +77,7 @@
   function payload() {
     var targets = $("targets").value.split(/[\r\n]+/).map(function (s) { return s.trim(); })
       .filter(function (s) { return s && s[0] !== "#"; });
-    if (!targets.length) { throw new Error("请先填写目标 URL（每行一个）"); }
+    if (!targets.length) { throw new Error("Please enter target URLs first (one per line)"); }
     var body = {
       targets: targets,
       mode: mode(),
@@ -116,7 +116,7 @@
       poll(true);
     }).catch(function (e) {
       $("start").disabled = false;
-      alert("启动失败：" + e.message);
+      alert("Failed to start: " + e.message);
     });
   }
 
@@ -140,7 +140,7 @@
         state.timer = setTimeout(function () { poll(false); }, immediate ? 200 : 1200);
       }
     }).catch(function (e) {
-      setHealth(false, "作业读取失败：" + e.message);
+      setHealth(false, "Failed to read job: " + e.message);
       state.timer = setTimeout(function () { poll(false); }, 3000);
     });
   }
@@ -154,7 +154,7 @@
     if (ev.post_max_gt_memory) { bits.push("post_max&gt;memory_limit"); }
     if (ev.sink) { bits.push("sink " + ev.sink); }
     if (ev.proof_body) { bits.push("proof " + String(ev.proof_body).replace(/\s+/g, " ").slice(0, 60)); }
-    if (ev.report_error) { bits.push("报告: " + String(ev.report_error).slice(0, 60)); }
+    if (ev.report_error) { bits.push("report: " + String(ev.report_error).slice(0, 60)); }
     return bits.join(" · ") || (t.summary || "-");
   }
 
@@ -198,7 +198,7 @@
     var shown = rows.length > RENDER_CAP ? rows.slice(0, RENDER_CAP) : rows;
     var tb = $("rows");
     if (!rows.length) {
-      tb.innerHTML = '<tr class="empty"><td colspan="8">无匹配目标</td></tr>';
+      tb.innerHTML = '<tr class="empty"><td colspan="8">No matching targets</td></tr>';
     } else {
       tb.innerHTML = shown.map(function (t) {
         var vb = VERDICT_BADGE[t.verdict] || "b-unknown";
@@ -215,8 +215,8 @@
           '<td><span class="badge ' + sb + '">' + esc(t.status || "-") + '</span></td>' +
           '</tr>';
       }).join("") + (rows.length > RENDER_CAP
-        ? '<tr class="empty"><td colspan="8">仅渲染前 ' + RENDER_CAP + ' 条（匹配 ' + rows.length +
-          ' 条，共 ' + tgl.length + ' 条）——已省略的请用“导出 JSON/CSV”查看，避免大列表拖慢浏览器</td></tr>'
+        ? '<tr class="empty"><td colspan="8">Only the first ' + RENDER_CAP + ' rows are rendered (matched ' + rows.length +
+          ' of ' + tgl.length + ') — use "Export JSON/CSV" to view the rest, so large lists do not slow the browser</td></tr>'
         : "");
     }
     Array.prototype.forEach.call(tb.querySelectorAll("tr[data-idx]"), function (tr) {
@@ -242,8 +242,8 @@
     $("d-url").textContent = t.url;
     var ev = t.evidence || {};
     var meta = [
-      ["结论", t.verdict || "-"], ["状态", t.status || "-"], ["rc", t.rc == null ? "-" : t.rc],
-      ["模式", ev.mode || "-"], ["PHP", ev.version || "-"], ["sink", ev.sink || "-"],
+      ["Verdict", t.verdict || "-"], ["Status", t.status || "-"], ["rc", t.rc == null ? "-" : t.rc],
+      ["Mode", ev.mode || "-"], ["PHP", ev.version || "-"], ["sink", ev.sink || "-"],
       ["profile", ev.profile || "-"], ["RCE", ev.rce ? "yes" : "no"],
       ["post_max>memory_limit", ev.post_max_gt_memory == null ? "-" : (ev.post_max_gt_memory ? "true" : "false")],
       ["OOM@MB", ev.oom_at_mb == null ? "-" : ev.oom_at_mb],
@@ -276,16 +276,16 @@
     $("recent").addEventListener("click", function () {
       api("/api/jobs").then(function (r) {
         var jobs = (r && r.jobs) || [];
-        if (!jobs.length) { alert("暂无历史作业"); return; }
+        if (!jobs.length) { alert("No recent jobs"); return; }
         state.job = jobs[0].job_id;
         state.sel = null;
         poll(true);
-      }).catch(function (e) { alert("读取作业列表失败：" + e.message); });
+      }).catch(function (e) { alert("Failed to read job list: " + e.message); });
     });
     refreshMode();
     api("/api/health").then(function (h) {
-      setHealth(true, "服务正常" + (h && h.version ? " " + h.version : ""));
-    }).catch(function (e) { setHealth(false, "服务异常：" + e.message); });
+      setHealth(true, "Service OK" + (h && h.version ? " " + h.version : ""));
+    }).catch(function (e) { setHealth(false, "Service error: " + e.message); });
     api("/api/jobs").then(function (r) {
       var jobs = (r && r.jobs) || [];
       if (jobs.length && jobs[0].status === "running") {

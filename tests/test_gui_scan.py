@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""回归：公网目标可直接使用；CLI/GUI 均不再有 scope 拦截。"""
+"""Regression: public targets can be used directly; neither CLI nor GUI has scope interception anymore."""
 import json
 import os
 import subprocess
@@ -18,7 +18,7 @@ import server as G  # noqa: E402
 
 
 class FakeJob(object):
-    """替代真实 Job：只记录入队参数，不启动子进程。"""
+    """Replacement for the real Job: only records enqueued arguments, does not start a subprocess."""
     seen = []
 
     def __init__(self, targets, opts):
@@ -148,7 +148,7 @@ class TimeoutVerdictTest(unittest.TestCase):
         job = G.Job(["http://127.0.0.1:9/"],
                     {"mode": "oneclick", "timeout": 5, "per_target_timeout": 900})
         job._exec = lambda cmd, log_path, timeout: (
-            2, "[1/5] scan\n\n[TIMEOUT] 超过 900s，已终止")
+            2, "[1/5] scan\n\n[TIMEOUT] exceeded 900s, terminated")
         res = job._run_one(job.targets[0])
         self.assertEqual(res["verdict"], "TIMEOUT")
         self.assertEqual(res["status"], "error")

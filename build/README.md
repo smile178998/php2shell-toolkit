@@ -1,26 +1,26 @@
 # build/
 
-把**目标同构建**的 `libphp.so` 放在这里，例如：
+Put the `libphp.so` from the **same build as the target** here, for example:
 
 ```
 build/libphp.so
 ```
 
-然后：
+Then:
 
 ```bash
 python attack/p2s_ext.py symbols --elf build/libphp.so --out profiles/range.json
 ```
 
-`symbols` 只读 ELF 符号表，不发任何网络请求。输出里必须有：
+`symbols` only reads the ELF symbol table and makes no network requests. The output must contain:
 
 ```
 zif_system    = 0x......
 zval_ptr_dtor = 0x......
 ```
 
-如果二进制被 strip、找不到这两个符号，就只能改用带符号的 debug 构建，
-或在目标同镜像里用 `readelf -sW` 确认；不要用别的版本的偏移硬套。
+If the binary has been stripped and these two symbols cannot be found, you can only switch to a debug build with symbols,
+or confirm with `readelf -sW` in the same image as the target; do not force-fit offsets from another version.
 
-这个 profile 的 `calibrated` 是 `false`，`ht_size`/`htdata_offset` 还是 base 值；
-必须先 `calibrate`，`oneclick` 才会接受它。
+This profile has `calibrated` set to `false`, and `ht_size`/`htdata_offset` are still base values;
+you must run `calibrate` first before `oneclick` will accept it.

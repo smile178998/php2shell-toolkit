@@ -125,7 +125,7 @@ pre.log{background:#0a1219;border:1px solid var(--line);border-radius:9px;paddin
   overflow:auto;font:11.5px/1.5 ui-monospace,Consolas,monospace;color:#a9bfd4;white-space:pre-wrap}
 .sect-title{font-size:12px;color:var(--dim);margin:12px 0 6px;letter-spacing:.3px}
 
-/* ---- CVE-2026-109618 控制台补充样式 ---- */
+/* ---- CVE-2026-109618 console extra styles ---- */
 .badge.b-found { background: #7f1d1d; color: #fee2e2; border-color: #b91c1c; }
 .badge.b-likely { background: #7c2d12; color: #ffedd5; border-color: #c2410c; }
 .badge.b-dos { background: #78350f; color: #fef3c7; border-color: #b45309; }
