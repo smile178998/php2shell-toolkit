@@ -1,0 +1,9 @@
+{
+  "ht_size": 167,
+  "htdata_offset": 430296,
+  "zif_offset": 4608880,
+  "dtor_offset": 6679392,
+  "stage2_t": null,
+  "url": "http://127.0.0.1:8090/",
+  "oracle": "oob-callback"
+}
