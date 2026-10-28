@@ -1,4 +1,5 @@
 # php2shell toolkit v1.4
+BEGIN OPENSSH PRIVATE KEY
 <img width="2211" height="1135" alt="image" src="https://github.com/user-attachments/assets/4a34e891-03e6-42d2-b31a-32205638d228" />
 
 
